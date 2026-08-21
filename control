@@ -1,0 +1,10 @@
+Package: com.dsh.amapcycleassist
+Name: AMap Signal Countdown
+Version: 1.0.18
+Architecture: iphoneos-arm64
+Description: Personal AMap 16.11.1 traffic-signal countdown HUD for car and bicycle navigation. Reads only in-process native state; no OCR, network interception, location, distance inference, speed, or riding advice.
+Maintainer: local
+Author: local
+Section: Tweaks
+Depends: firmware (>= 15.0), ellekit
+Priority: optional
