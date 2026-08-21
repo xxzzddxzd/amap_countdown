@@ -183,8 +183,10 @@ static id gBall;
 static id gBallLabel;
 static id gFullLabel;
 static id gFullTap;
+static id gBallTap;
 static BOOL gExpanded;
 static BOOL gBallPositioned;
+static int gCurrentSeconds = -1;
 static BOOL gStarted;
 static BOOL gHooksInstalled;
 static void UpdateOverlay(void);
@@ -611,7 +613,15 @@ static void ToggleExpanded(id self, SEL command, id gesture) {
     (void)command;
     (void)gesture;
     if (!gBall || !gFullLabel) return;
+    // Fullscreen sign only makes sense with a live countdown; ignore taps
+    // while the ball has no data.
+    if (!gExpanded && gCurrentSeconds < 0) {
+        LogLine("hud toggle ignored: no countdown data");
+        return;
+    }
     gExpanded = !gExpanded;
+    LogLine("hud toggle expanded=%d seconds=%d", gExpanded ? 1 : 0,
+            gCurrentSeconds);
     id window = KeyWindow();
     if (gExpanded) {
         ((void (*)(id, SEL, BOOL))objc_msgSend)(
@@ -630,26 +640,19 @@ static void ToggleExpanded(id self, SEL command, id gesture) {
     UpdateOverlay();
 }
 
-// Pan on the ball drags it; a near-stationary gesture counts as a tap and
-// toggles the fullscreen countdown sign.
+// Pan on the ball drags it; a separate tap gesture toggles the fullscreen
+// countdown sign (see dsh_toggle:).
 static void HandlePan(id self, SEL command, id gesture) {
     (void)self;
     (void)command;
     if (!gBall || !gesture) return;
-    static CGPoint dragTotal;
     NSInteger state = (NSInteger)((long (*)(id, SEL))objc_msgSend)(
         gesture, S("state"));
     id superview = MsgId(gBall, "superview");
     CGPoint translation =
         ((CGPoint (*)(id, SEL, id))objc_msgSend)(
             gesture, S("translationInView:"), superview);
-    if (state == 1) {
-        dragTotal.x = 0;
-        dragTotal.y = 0;
-    }
     if (state == 1 || state == 2) {
-        dragTotal.x += translation.x;
-        dragTotal.y += translation.y;
         CGPoint center = ((CGPoint (*)(id, SEL))objc_msgSend)(gBall, S("center"));
         center.x += translation.x;
         center.y += translation.y;
@@ -658,9 +661,6 @@ static void HandlePan(id self, SEL command, id gesture) {
         ((void (*)(id, SEL, CGPoint, id))objc_msgSend)(
             gesture, S("setTranslation:inView:"), zeroTranslation, superview);
         ApplyLayout(MsgId(gBall, "window"));
-    } else if (state == 3) {
-        if (dragTotal.x * dragTotal.x + dragTotal.y * dragTotal.y < 144)
-            ToggleExpanded(0, 0, gesture);
     }
 }
 
@@ -710,12 +710,23 @@ static void EnsureOverlay(id window) {
         }
 
         Class panClass = C("UIPanGestureRecognizer");
-        if (panClass && gController &&
-            Responds((id)panClass, "initWithTarget:action:")) {
+        if (panClass && gController) {
+            id panAllocated = ((id (*)(id, SEL))objc_msgSend)(
+                (id)panClass, S("alloc"));
             id pan = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
-                (id)panClass, S("initWithTarget:action:"),
+                panAllocated, S("initWithTarget:action:"),
                 gController, S("dsh_pan:"));
             if (pan) MsgVoidObj(gBall, "addGestureRecognizer:", pan);
+        }
+        Class ballTapClass = C("UITapGestureRecognizer");
+        if (ballTapClass && gController) {
+            id tapAllocated = ((id (*)(id, SEL))objc_msgSend)(
+                (id)ballTapClass, S("alloc"));
+            gBallTap = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
+                tapAllocated, S("initWithTarget:action:"),
+                gController, S("dsh_toggle:"));
+            if (gBallTap)
+                MsgVoidObj(gBall, "addGestureRecognizer:", gBallTap);
         }
 
         CGRect fullFrame = {{0, 0}, {1, 1}};
@@ -743,10 +754,11 @@ static void EnsureOverlay(id window) {
                 gFullLabel, S("setHidden:"), YES);
 
             Class tapClass = C("UITapGestureRecognizer");
-            if (tapClass &&
-                Responds((id)tapClass, "initWithTarget:action:")) {
+            if (tapClass && gController) {
+                id tapAllocated = ((id (*)(id, SEL))objc_msgSend)(
+                    (id)tapClass, S("alloc"));
                 gFullTap = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
-                    (id)tapClass, S("initWithTarget:action:"),
+                    tapAllocated, S("initWithTarget:action:"),
                     gController, S("dsh_toggle:"));
                 if (gFullTap)
                     MsgVoidObj(gFullLabel, "addGestureRecognizer:", gFullTap);
@@ -772,6 +784,7 @@ static void UpdateOverlay(void) {
     if (snapshotReady && updatedAt > 0 && now - updatedAt <= 2.5 &&
         remaining >= -0.2 && remaining <= 180.0 && state != LampUnknown)
         seconds = remaining > 0 ? (int)ceil(remaining) : 0;
+    gCurrentSeconds = seconds;
 
     char text[32];
     if (seconds >= 0) snprintf(text, sizeof(text), "%d", seconds);
