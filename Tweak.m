@@ -177,19 +177,9 @@ static _Atomic unsigned gDisplayGeneration;
 static _Atomic uint64_t gCyclingTable[kMaxCyclingPhases * 3 + 1];
 static id gController;
 static id gTimer;
-// Floating-ball HUD: a round ball that tints with the lamp color and shows
-// the remaining seconds; tapping it expands a fullscreen countdown sign.
-static id gBall;
-static id gBallLabel;
-static id gFullLabel;
-static id gFullTap;
-static id gBallTap;
-static BOOL gExpanded;
-static BOOL gBallPositioned;
-static int gCurrentSeconds = -1;
+static id gOverlay;
 static BOOL gStarted;
 static BOOL gHooksInstalled;
-static void UpdateOverlay(void);
 
 static uintptr_t AMapMainImageBase(void) {
     uint32_t count = _dyld_image_count();
@@ -572,245 +562,79 @@ static id KeyWindow(void) {
     return fallback;
 }
 
-static id LampColor(LampState state) {
-    Class colorClass = C("UIColor");
-    if (!colorClass) return (id)0;
-    CGFloat red = 0.25, green = 0.25, blue = 0.28, alpha = 0.92;
-    if (state == LampRed) {
-        red = 0.88; green = 0.16; blue = 0.16; alpha = 1.0;
-    } else if (state == LampYellow) {
-        red = 0.96; green = 0.72; blue = 0.06; alpha = 1.0;
-    } else if (state == LampGreen) {
-        red = 0.14; green = 0.70; blue = 0.30; alpha = 1.0;
-    }
-    return ((id (*)(id, SEL, CGFloat, CGFloat, CGFloat, CGFloat))objc_msgSend)(
-        (id)colorClass, S("colorWithRed:green:blue:alpha:"),
-        red, green, blue, alpha);
-}
-
-static void ApplyLayout(id window) {
-    if (!gBall || !window) return;
-    CGRect bounds = MsgRect(window, "bounds");
-    CGFloat width = bounds.size.width, height = bounds.size.height;
-    if (width < 60 || height < 60) return;
-    if (gExpanded && gFullLabel)
-        SetRect(gFullLabel, "setFrame:", (CGRect){{0, 0}, {width, height}});
-    CGPoint center = ((CGPoint (*)(id, SEL))objc_msgSend)(gBall, S("center"));
-    if (!gBallPositioned) {
-        center.x = width - 54;
-        center.y = 120;
-        gBallPositioned = YES;
-    }
-    if (center.x < 36) center.x = 36;
-    if (center.y < 36) center.y = 36;
-    if (center.x > width - 36) center.x = width - 36;
-    if (center.y > height - 36) center.y = height - 36;
-    ((void (*)(id, SEL, CGPoint))objc_msgSend)(gBall, S("setCenter:"), center);
-}
-
-static void ToggleExpanded(id self, SEL command, id gesture) {
-    (void)self;
-    (void)command;
-    (void)gesture;
-    if (!gBall || !gFullLabel) return;
-    // Fullscreen sign only makes sense with a live countdown; ignore taps
-    // while the ball has no data.
-    if (!gExpanded && gCurrentSeconds < 0) {
-        LogLine("hud toggle ignored: no countdown data");
-        return;
-    }
-    gExpanded = !gExpanded;
-    LogLine("hud toggle expanded=%d seconds=%d", gExpanded ? 1 : 0,
-            gCurrentSeconds);
-    id window = KeyWindow();
-    if (gExpanded) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(
-            gFullLabel, S("setHidden:"), NO);
-        if (window) {
-            MsgVoidObj(window, "addSubview:", gFullLabel);
-            if (Responds(window, "bringSubviewToFront:"))
-                MsgVoidObj(window, "bringSubviewToFront:", gFullLabel);
-        }
-    } else {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(
-            gFullLabel, S("setHidden:"), YES);
-        MsgVoid(gFullLabel, "removeFromSuperview");
-    }
-    ApplyLayout(window ? window : KeyWindow());
-    UpdateOverlay();
-}
-
-// Pan on the ball drags it; a separate tap gesture toggles the fullscreen
-// countdown sign (see dsh_toggle:).
-static void HandlePan(id self, SEL command, id gesture) {
-    (void)self;
-    (void)command;
-    if (!gBall || !gesture) return;
-    NSInteger state = (NSInteger)((long (*)(id, SEL))objc_msgSend)(
-        gesture, S("state"));
-    id superview = MsgId(gBall, "superview");
-    CGPoint translation =
-        ((CGPoint (*)(id, SEL, id))objc_msgSend)(
-            gesture, S("translationInView:"), superview);
-    if (state == 1 || state == 2) {
-        CGPoint center = ((CGPoint (*)(id, SEL))objc_msgSend)(gBall, S("center"));
-        center.x += translation.x;
-        center.y += translation.y;
-        ((void (*)(id, SEL, CGPoint))objc_msgSend)(gBall, S("setCenter:"), center);
-        CGPoint zeroTranslation = {0, 0};
-        ((void (*)(id, SEL, CGPoint, id))objc_msgSend)(
-            gesture, S("setTranslation:inView:"), zeroTranslation, superview);
-        ApplyLayout(MsgId(gBall, "window"));
-    }
-}
-
 static void EnsureOverlay(id window) {
     if (!window) return;
-    if (!gBall) {
-        Class viewClass = C("UIView");
+    if (!gOverlay) {
         Class labelClass = C("UILabel");
-        if (!viewClass || !labelClass) return;
-
-        CGRect ballFrame = {{0, 0}, {68, 68}};
-        id ballAllocated = ((id (*)(id, SEL))objc_msgSend)((id)viewClass, S("alloc"));
-        gBall = ((id (*)(id, SEL, CGRect))objc_msgSend)(
-            ballAllocated, S("initWithFrame:"), ballFrame);
-        if (!gBall) return;
+        if (!labelClass) return;
+        CGRect initial = {{10, 52}, {300, 44}};
+        id allocated = ((id (*)(id, SEL))objc_msgSend)((id)labelClass, S("alloc"));
+        gOverlay = ((id (*)(id, SEL, CGRect))objc_msgSend)(
+            allocated, S("initWithFrame:"), initial);
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(
+            gOverlay, S("setTextAlignment:"), 1);
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(
+            gOverlay, S("setNumberOfLines:"), 2);
         ((void (*)(id, SEL, BOOL))objc_msgSend)(
-            gBall, S("setUserInteractionEnabled:"), YES);
+            gOverlay, S("setUserInteractionEnabled:"), NO);
 
-        id labelAllocated = ((id (*)(id, SEL))objc_msgSend)((id)labelClass, S("alloc"));
-        gBallLabel = ((id (*)(id, SEL, CGRect))objc_msgSend)(
-            labelAllocated, S("initWithFrame:"), ballFrame);
-        if (gBallLabel) {
-            ((void (*)(id, SEL, NSInteger))objc_msgSend)(
-                gBallLabel, S("setTextAlignment:"), 1);
-            ((void (*)(id, SEL, NSInteger))objc_msgSend)(
-                gBallLabel, S("setNumberOfLines:"), 1);
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(
-                gBallLabel, S("setUserInteractionEnabled:"), NO);
-            MsgVoidObj(gBallLabel, "setTextColor:",
-                       MsgId((id)C("UIColor"), "whiteColor"));
-            id font = ((id (*)(id, SEL, CGFloat))objc_msgSend)(
-                (id)C("UIFont"), S("boldSystemFontOfSize:"), 24.0);
-            MsgVoidObj(gBallLabel, "setFont:", font);
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(
-                gBallLabel, S("setAdjustsFontSizeToFitWidth:"), YES);
-            ((void (*)(id, SEL, CGFloat))objc_msgSend)(
-                gBallLabel, S("setMinimumScaleFactor:"), 0.4);
-            MsgVoidObj(gBall, "addSubview:", gBallLabel);
+        Class colorClass = C("UIColor");
+        if (colorClass) {
+            MsgVoidObj(gOverlay, "setTextColor:", MsgId((id)colorClass, "whiteColor"));
+            id background = ((id (*)(id, SEL, CGFloat, CGFloat))objc_msgSend)(
+                (id)colorClass, S("colorWithWhite:alpha:"), 0.05, 0.78);
+            MsgVoidObj(gOverlay, "setBackgroundColor:", background);
         }
-
-        id layer = MsgId(gBall, "layer");
+        Class fontClass = C("UIFont");
+        if (fontClass) {
+            id font = ((id (*)(id, SEL, CGFloat))objc_msgSend)(
+                (id)fontClass, S("boldSystemFontOfSize:"), 14.0);
+            MsgVoidObj(gOverlay, "setFont:", font);
+        }
+        id layer = MsgId(gOverlay, "layer");
         if (layer) {
             ((void (*)(id, SEL, CGFloat))objc_msgSend)(
-                layer, S("setCornerRadius:"), 34.0);
+                layer, S("setCornerRadius:"), 10.0);
             ((void (*)(id, SEL, BOOL))objc_msgSend)(
                 layer, S("setMasksToBounds:"), YES);
         }
-
-        Class panClass = C("UIPanGestureRecognizer");
-        if (panClass && gController) {
-            id panAllocated = ((id (*)(id, SEL))objc_msgSend)(
-                (id)panClass, S("alloc"));
-            id pan = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
-                panAllocated, S("initWithTarget:action:"),
-                gController, S("dsh_pan:"));
-            if (pan) MsgVoidObj(gBall, "addGestureRecognizer:", pan);
-        }
-        Class ballTapClass = C("UITapGestureRecognizer");
-        if (ballTapClass && gController) {
-            id tapAllocated = ((id (*)(id, SEL))objc_msgSend)(
-                (id)ballTapClass, S("alloc"));
-            gBallTap = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
-                tapAllocated, S("initWithTarget:action:"),
-                gController, S("dsh_toggle:"));
-            if (gBallTap)
-                MsgVoidObj(gBall, "addGestureRecognizer:", gBallTap);
-        }
-
-        CGRect fullFrame = {{0, 0}, {1, 1}};
-        id fullAllocated = ((id (*)(id, SEL))objc_msgSend)((id)labelClass, S("alloc"));
-        gFullLabel = ((id (*)(id, SEL, CGRect))objc_msgSend)(
-            fullAllocated, S("initWithFrame:"), fullFrame);
-        if (gFullLabel) {
-            ((void (*)(id, SEL, NSInteger))objc_msgSend)(
-                gFullLabel, S("setTextAlignment:"), 1);
-            ((void (*)(id, SEL, NSInteger))objc_msgSend)(
-                gFullLabel, S("setNumberOfLines:"), 1);
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(
-                gFullLabel, S("setUserInteractionEnabled:"), YES);
-            MsgVoidObj(gFullLabel, "setBackgroundColor:",
-                       MsgId((id)C("UIColor"), "blackColor"));
-            MsgVoidObj(gFullLabel, "setTextColor:",
-                       MsgId((id)C("UIColor"), "lightGrayColor"));
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(
-                gFullLabel, S("setAdjustsFontSizeToFitWidth:"), YES);
-            ((void (*)(id, SEL, CGFloat))objc_msgSend)(
-                gFullLabel, S("setMinimumScaleFactor:"), 0.05);
-            ((void (*)(id, SEL, NSUInteger))objc_msgSend)(
-                gFullLabel, S("setAutoresizingMask:"), (NSUInteger)6);
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(
-                gFullLabel, S("setHidden:"), YES);
-
-            Class tapClass = C("UITapGestureRecognizer");
-            if (tapClass && gController) {
-                id tapAllocated = ((id (*)(id, SEL))objc_msgSend)(
-                    (id)tapClass, S("alloc"));
-                gFullTap = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
-                    tapAllocated, S("initWithTarget:action:"),
-                    gController, S("dsh_toggle:"));
-                if (gFullTap)
-                    MsgVoidObj(gFullLabel, "addGestureRecognizer:", gFullTap);
-            }
-        }
     }
 
-    id currentWindow = MsgId(gBall, "window");
-    if (currentWindow != window) MsgVoidObj(window, "addSubview:", gBall);
+    CGRect bounds = MsgRect(window, "bounds");
+    CGFloat width = bounds.size.width > 40 ? bounds.size.width - 20 : 300;
+    SetRect(gOverlay, "setFrame:", (CGRect){{10, 52}, {width, 44}});
+    id currentWindow = MsgId(gOverlay, "window");
+    if (currentWindow != window) MsgVoidObj(window, "addSubview:", gOverlay);
     if (Responds(window, "bringSubviewToFront:"))
-        MsgVoidObj(window, "bringSubviewToFront:", gBall);
-    ApplyLayout(window);
+        MsgVoidObj(window, "bringSubviewToFront:", gOverlay);
+}
+
+static const char *LampName(LampState state) {
+    if (state == LampRed) return "红灯";
+    if (state == LampYellow) return "黄灯";
+    if (state == LampGreen) return "绿灯";
+    return "未知";
 }
 
 static void UpdateOverlay(void) {
-    if (!gBall) return;
+    if (!gOverlay) return;
     double now = MonotonicSeconds();
     LampState state = LampUnknown;
     double phaseEnd = 0, updatedAt = 0;
     BOOL snapshotReady = LoadDisplayState(&state, &phaseEnd, &updatedAt);
     double remaining = phaseEnd - now;
-    int seconds = -1;
+    char text[256];
     if (snapshotReady && updatedAt > 0 && now - updatedAt <= 2.5 &&
-        remaining >= -0.2 && remaining <= 180.0 && state != LampUnknown)
-        seconds = remaining > 0 ? (int)ceil(remaining) : 0;
-    gCurrentSeconds = seconds;
-
-    char text[32];
-    if (seconds >= 0) snprintf(text, sizeof(text), "%d", seconds);
-    else snprintf(text, sizeof(text), "-");
-    id textString = NSStr(text);
-    id color = LampColor(seconds >= 0 ? state : LampUnknown);
-
-    MsgVoidObj(gBall, "setBackgroundColor:", color);
-    if (gBallLabel && textString) MsgVoidObj(gBallLabel, "setText:", textString);
-
-    if (gExpanded && gFullLabel) {
-        id numberColor = color;
-        if (seconds < 0)
-            numberColor = MsgId((id)C("UIColor"), "lightGrayColor");
-        MsgVoidObj(gFullLabel, "setTextColor:", numberColor);
-        if (textString) MsgVoidObj(gFullLabel, "setText:", textString);
-        id window = KeyWindow();
-        if (window) {
-            CGRect bounds = MsgRect(window, "bounds");
-            CGFloat fontSize = bounds.size.height > 100
-                ? bounds.size.height * 0.85 : 200.0;
-            id font = ((id (*)(id, SEL, CGFloat))objc_msgSend)(
-                (id)C("UIFont"), S("boldSystemFontOfSize:"), fontSize);
-            MsgVoidObj(gFullLabel, "setFont:", font);
-        }
+        remaining >= -0.2 && remaining <= 180.0 && state != LampUnknown) {
+        int seconds = remaining > 0 ? (int)ceil(remaining) : 0;
+        snprintf(text, sizeof(text),
+                 "信号灯倒计时｜%s %d秒\n仅供参考，以现场信号灯为准",
+                 LampName(state), seconds);
+    } else {
+        snprintf(text, sizeof(text),
+                 "信号灯倒计时｜等待高德数据…\n仅供参考，以现场信号灯为准");
     }
+    MsgVoidObj(gOverlay, "setText:", NSStr(text));
 }
 
 static void ScheduleTimer(void) {
@@ -887,8 +711,6 @@ __attribute__((constructor)) static void AMapSignalCountdownInit(void) {
     class_addMethod(controllerClass, S("dsh_tick:"), (IMP)Tick, "v@:@");
     class_addMethod(controllerClass, S("dsh_background:"), (IMP)EnterBackground, "v@:@");
     class_addMethod(controllerClass, S("dsh_foreground:"), (IMP)EnterForeground, "v@:@");
-    class_addMethod(controllerClass, S("dsh_toggle:"), (IMP)ToggleExpanded, "v@:@");
-    class_addMethod(controllerClass, S("dsh_pan:"), (IMP)HandlePan, "v@:@");
     gController = MsgId((id)controllerClass, "new");
     if (gController && Responds(gController, "performSelector:withObject:afterDelay:")) {
         ((void (*)(id, SEL, SEL, id, double))objc_msgSend)(
