@@ -148,6 +148,10 @@ typedef void *(*SignalStatusSerializeFn)(void *model, void *serializer);
 typedef void *(*TravelStatusSerializeFn)(void *model, void *serializer);
 typedef void *(*TravelStatusArrayFn)(void *writer, void *unused,
                                      void *vector);
+typedef void *(*JsonWriteInt32Fn)(void *writer, const char *name,
+                                  int32_t value, void *extra);
+typedef void *(*JsonWriteInt64Fn)(void *writer, const char *name,
+                                  int64_t value);
 typedef int (*ActiveTrafficRecordsFn)(void *records);
 typedef void *(*CyclingTimetableEvaluateFn)(void *context, void *phases,
                                             uint64_t currentTime, void *outA,
@@ -163,6 +167,8 @@ typedef enum {
 static SignalStatusSerializeFn gOriginalSignalStatusSerialize;
 static TravelStatusSerializeFn gOriginalTravelStatusSerialize;
 static TravelStatusArrayFn gOriginalTravelStatusArray;
+static JsonWriteInt32Fn gOriginalJsonWriteInt32;
+static JsonWriteInt64Fn gOriginalJsonWriteInt64;
 static ActiveTrafficRecordsFn gOriginalActiveTrafficRecords;
 static CyclingTimetableEvaluateFn gOriginalCyclingTimetableEvaluate;
 static _Atomic int gNativeStatus = -1;
@@ -576,6 +582,51 @@ static void *HookTravelStatusArray(void *writer, void *unused, void *vector) {
     return result;
 }
 
+// Temporary diagnostic taps on the shared JSON field writers. Every model
+// serialization funnels through these two functions, so filtering by light
+// related field names exposes whichever component actually produces the
+// bike bubble data, together with its return address. To be removed once
+// the production site is identified.
+static int LightFieldName(const char *name) {
+    if (!PlausibleNativePointer((uintptr_t)name, 1)) return -1;
+    char c = name[0];
+    if (c != 'r' && c != 's' && c != 'c' && c != 'p' && c != 'l') return -1;
+    static const char *const kNames[] = {
+        "remainTime", "status",     "countDown", "countdown",
+        "passThrough", "lightStatus"};
+    for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); ++i)
+        if (strcmp(name, kNames[i]) == 0) return (int)i;
+    return -1;
+}
+
+static void *HookJsonWriteInt32(void *writer, const char *name,
+                                int32_t value, void *extra) {
+    static _Atomic double lastLogged;
+    double now = WallSeconds();
+    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 3.0 &&
+        LightFieldName(name) == 1 && value >= 0 && value <= 15) {
+        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
+        LogLine("json i32 %s=%d lr=%p", name, value,
+                __builtin_return_address(0));
+    }
+    return gOriginalJsonWriteInt32
+        ? gOriginalJsonWriteInt32(writer, name, value, extra) : 0;
+}
+
+static void *HookJsonWriteInt64(void *writer, const char *name,
+                                int64_t value) {
+    static _Atomic double lastLogged;
+    double now = WallSeconds();
+    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 3.0 &&
+        LightFieldName(name) == 0 && value > 0 && value < 3600) {
+        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
+        LogLine("json i64 %s=%lld lr=%p", name, (long long)value,
+                __builtin_return_address(0));
+    }
+    return gOriginalJsonWriteInt64
+        ? gOriginalJsonWriteInt64(writer, name, value) : 0;
+}
+
 static void InstallNativeHooks(void) {
     if (gHooksInstalled) return;
     gHooksInstalled = YES;
@@ -599,6 +650,11 @@ static void InstallNativeHooks(void) {
          (void **)&gOriginalTravelStatusSerialize);
     hook((void *)(base + 0x0078856CULL), (void *)HookTravelStatusArray,
          (void **)&gOriginalTravelStatusArray);
+    // Shared JSON field writers (see hooks above).
+    hook((void *)(base + 0x104388B94ULL), (void *)HookJsonWriteInt32,
+         (void **)&gOriginalJsonWriteInt32);
+    hook((void *)(base + 0x104388BB4ULL), (void *)HookJsonWriteInt64,
+         (void **)&gOriginalJsonWriteInt64);
     {
         uint32_t prologue[4] = {0};
         memcpy(prologue, (const void *)(base + 0x00788474ULL),
@@ -608,6 +664,10 @@ static void InstallNativeHooks(void) {
         memcpy(prologue, (const void *)(base + 0x0078856CULL),
                sizeof(prologue));
         LogLine("prologue travel-array %08x %08x %08x %08x",
+                prologue[0], prologue[1], prologue[2], prologue[3]);
+        memcpy(prologue, (const void *)(base + 0x104388B94ULL),
+               sizeof(prologue));
+        LogLine("prologue json-i32 %08x %08x %08x %08x",
                 prologue[0], prologue[1], prologue[2], prologue[3]);
     }
     hook((void *)(base + 0x011FF8C0ULL), (void *)HookActiveTrafficRecords,
