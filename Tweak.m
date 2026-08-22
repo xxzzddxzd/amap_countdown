@@ -145,6 +145,9 @@ static void LogLine(const char *format, ...) {
 
 typedef void (*MSHookFunctionFn)(void *symbol, void *replacement, void **original);
 typedef void *(*SignalStatusSerializeFn)(void *model, void *serializer);
+typedef void *(*TravelStatusSerializeFn)(void *model, void *serializer);
+typedef void *(*TravelStatusArrayFn)(void *writer, void *unused,
+                                     void *vector);
 typedef int (*ActiveTrafficRecordsFn)(void *records);
 typedef void *(*CyclingTimetableEvaluateFn)(void *context, void *phases,
                                             uint64_t currentTime, void *outA,
@@ -158,6 +161,8 @@ typedef enum {
 } LampState;
 
 static SignalStatusSerializeFn gOriginalSignalStatusSerialize;
+static TravelStatusSerializeFn gOriginalTravelStatusSerialize;
+static TravelStatusArrayFn gOriginalTravelStatusArray;
 static ActiveTrafficRecordsFn gOriginalActiveTrafficRecords;
 static CyclingTimetableEvaluateFn gOriginalCyclingTimetableEvaluate;
 static _Atomic int gNativeStatus = -1;
@@ -521,6 +526,56 @@ static void *HookCyclingTimetableEvaluate(void *context, void *phases,
     return result;
 }
 
+// Travel/bike signal status serializer (unslid 0x788474): serializes the
+// model {status @0x8, remainTime @0x10, mainAction @0x18, showType @0x1c}
+// that feeds the bike route bubble. Same reliable production pattern as the
+// car signal serializer.
+static void *HookTravelStatusSerialize(void *model, void *serializer) {
+    void *result = gOriginalTravelStatusSerialize
+        ? gOriginalTravelStatusSerialize(model, serializer) : 0;
+    static _Atomic double lastLogged;
+    double now = WallSeconds();
+    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 5.0) {
+        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
+        int32_t status = -1, mainAction = -1, showType = -1;
+        int64_t remainTime = -1;
+        if (PlausibleNativePointer((uintptr_t)model, 4)) {
+            memcpy(&status, (const char *)model + 0x08, sizeof(status));
+            memcpy(&remainTime, (const char *)model + 0x10, sizeof(remainTime));
+            memcpy(&mainAction, (const char *)model + 0x18, sizeof(mainAction));
+            memcpy(&showType, (const char *)model + 0x1c, sizeof(showType));
+        }
+        LogLine("travel status st=%d remain=%lld action=%d show=%d",
+                status, (long long)remainTime, mainAction, showType);
+    }
+    return result;
+}
+
+// Array variant (unslid 0x788568): fires whenever the travel signal list
+// serializes, even when empty; distinguishes a dormant path from an empty
+// list.
+static void *HookTravelStatusArray(void *writer, void *unused, void *vector) {
+    void *result = gOriginalTravelStatusArray
+        ? gOriginalTravelStatusArray(writer, unused, vector) : 0;
+    static _Atomic double lastLogged;
+    double now = WallSeconds();
+    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 10.0) {
+        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
+        uint64_t begin = 0, end = 0;
+        size_t count = 0;
+        if (PlausibleNativePointer((uintptr_t)vector, 8)) {
+            memcpy(&begin, vector, sizeof(begin));
+            memcpy(&end, (const char *)vector + 8, sizeof(end));
+            if (PlausibleNativeRange(begin, end, 32 * 1024, 8) && end >= begin)
+                count = (size_t)((end - begin) >> 5);
+            else
+                count = (size_t)-1;
+        }
+        LogLine("travel array count=%zu", count);
+    }
+    return result;
+}
+
 static void InstallNativeHooks(void) {
     if (gHooksInstalled) return;
     gHooksInstalled = YES;
@@ -539,6 +594,22 @@ static void InstallNativeHooks(void) {
     // Version-specific unslid offsets verified against AMapiPhone 16.11.1.
     hook((void *)(base + 0x00788410ULL), (void *)HookSignalStatusSerialize,
          (void **)&gOriginalSignalStatusSerialize);
+    // Travel/bike signal status model serializer.
+    hook((void *)(base + 0x00788474ULL), (void *)HookTravelStatusSerialize,
+         (void **)&gOriginalTravelStatusSerialize);
+    hook((void *)(base + 0x0078856CULL), (void *)HookTravelStatusArray,
+         (void **)&gOriginalTravelStatusArray);
+    {
+        uint32_t prologue[4] = {0};
+        memcpy(prologue, (const void *)(base + 0x00788474ULL),
+               sizeof(prologue));
+        LogLine("prologue travel-status %08x %08x %08x %08x",
+                prologue[0], prologue[1], prologue[2], prologue[3]);
+        memcpy(prologue, (const void *)(base + 0x0078856CULL),
+               sizeof(prologue));
+        LogLine("prologue travel-array %08x %08x %08x %08x",
+                prologue[0], prologue[1], prologue[2], prologue[3]);
+    }
     hook((void *)(base + 0x011FF8C0ULL), (void *)HookActiveTrafficRecords,
          (void **)&gOriginalActiveTrafficRecords);
     // Bicycle observation goes through the standard-ABI wrapper, never the
