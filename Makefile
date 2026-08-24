@@ -1,7 +1,7 @@
 SHELL := /var/jb/usr/bin/bash
 
 PACKAGE_ID := com.dsh.amapcycleassist
-PACKAGE_VERSION := 1.0.26
+PACKAGE_VERSION := 1.0.27
 CLANG ?= clang-16
 LDID ?= ldid
 DPKG_DEB ?= dpkg-deb

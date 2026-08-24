@@ -152,6 +152,8 @@ typedef void *(*JsonWriteInt32Fn)(void *writer, const char *name,
                                   int32_t value, void *extra);
 typedef void *(*JsonWriteInt64Fn)(void *writer, const char *name,
                                   int64_t value);
+typedef void *(*BusPostFn)(void *bus, void *nameString, void *event);
+typedef void *(*PublishCountdownFn)(void *bus, void *event);
 typedef int (*ActiveTrafficRecordsFn)(void *records);
 typedef void *(*CyclingTimetableEvaluateFn)(void *context, void *phases,
                                             uint64_t currentTime, void *outA,
@@ -169,6 +171,8 @@ static TravelStatusSerializeFn gOriginalTravelStatusSerialize;
 static TravelStatusArrayFn gOriginalTravelStatusArray;
 static JsonWriteInt32Fn gOriginalJsonWriteInt32;
 static JsonWriteInt64Fn gOriginalJsonWriteInt64;
+static BusPostFn gOriginalBusPost;
+static PublishCountdownFn gOriginalPublishCountdown;
 static ActiveTrafficRecordsFn gOriginalActiveTrafficRecords;
 static CyclingTimetableEvaluateFn gOriginalCyclingTimetableEvaluate;
 static _Atomic int gNativeStatus = -1;
@@ -627,6 +631,47 @@ static void *HookJsonWriteInt64(void *writer, const char *name,
         ? gOriginalJsonWriteInt64(writer, name, value) : 0;
 }
 
+// libc++ std::string reader (both SSO forms).
+static const char *StdStringChars(const void *str) {
+    const uint8_t *bytes = (const uint8_t *)str;
+    if (!PlausibleNativePointer((uintptr_t)str, 1)) return "";
+    if (!(bytes[0] & 1)) return (const char *)str;
+    const char *heap = 0;
+    memcpy(&heap, (const char *)str + 16, sizeof(heap));
+    return PlausibleNativePointer((uintptr_t)heap, 1) ? heap : "";
+}
+
+// Event-bus post tap: logs every distinct event name flowing through the
+// TBT event bus while navigating, exposing whichever channel actually
+// carries the live bike countdown.
+static void *HookBusPost(void *bus, void *nameString, void *event) {
+    static _Atomic double lastLogged;
+    double now = WallSeconds();
+    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 2.0) {
+        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
+        LogLine("bus post %s", StdStringChars(nameString));
+    }
+    return gOriginalBusPost ? gOriginalBusPost(bus, nameString, event) : 0;
+}
+
+// Cruise signal countdown publisher tap: dumps the raw event payload so the
+// field layout can be decoded against the visible bubble.
+static void *HookPublishCountdown(void *bus, void *event) {
+    static _Atomic double lastLogged;
+    double now = WallSeconds();
+    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 1.0 &&
+        PlausibleNativePointer((uintptr_t)event, 4)) {
+        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
+        uint64_t w[3] = {0};
+        memcpy(w, event, sizeof(w));
+        LogLine("cruise countdown evt %016llx %016llx %016llx",
+                (unsigned long long)w[0], (unsigned long long)w[1],
+                (unsigned long long)w[2]);
+    }
+    return gOriginalPublishCountdown
+        ? gOriginalPublishCountdown(bus, event) : 0;
+}
+
 static void InstallNativeHooks(void) {
     if (gHooksInstalled) return;
     gHooksInstalled = YES;
@@ -655,6 +700,11 @@ static void InstallNativeHooks(void) {
          (void **)&gOriginalJsonWriteInt32);
     hook((void *)(base + 0x104388BB4ULL), (void *)HookJsonWriteInt64,
          (void **)&gOriginalJsonWriteInt64);
+    // TBT event bus taps.
+    hook((void *)(base + 0x1011EE5BCULL), (void *)HookBusPost,
+         (void **)&gOriginalBusPost);
+    hook((void *)(base + 0x1010FE0FCULL), (void *)HookPublishCountdown,
+         (void **)&gOriginalPublishCountdown);
     {
         uint32_t prologue[4] = {0};
         memcpy(prologue, (const void *)(base + 0x00788474ULL),
