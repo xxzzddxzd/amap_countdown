@@ -324,9 +324,26 @@ static BOOL PublishLiveCyclingPhase(double wallNow, double monotonicNow) {
         }
     }
 
-    if (state == LampUnknown || endsAt <= now) return NO;
+    if (state == LampUnknown || endsAt <= now) {
+        static _Atomic double lastWalkMiss;
+        double wnow2 = WallSeconds();
+        if (wnow2 - atomic_load_explicit(&lastWalkMiss,
+                memory_order_relaxed) > 10.0) {
+            atomic_store_explicit(&lastWalkMiss, wnow2,
+                                  memory_order_relaxed);
+            LogLine("walk miss now=%lld count=%u", (long long)now, count);
+        }
+        return NO;
+    }
     double remaining = (double)(endsAt - now);
     if (remaining > 180.0) return NO;
+    static _Atomic double lastWalkHit;
+    double wnow = WallSeconds();
+    if (wnow - atomic_load_explicit(&lastWalkHit,
+            memory_order_relaxed) > 10.0) {
+        atomic_store_explicit(&lastWalkHit, wnow, memory_order_relaxed);
+        LogLine("walk hit state=%d remain=%.0f", (int)state, remaining);
+    }
     PublishDisplayState(state, monotonicNow + remaining, monotonicNow);
     return YES;
 }
@@ -818,20 +835,40 @@ static void UpdateOverlay(void) {
     MsgVoidObj(gOverlay, "setText:", NSStr(text));
 }
 
-static void ScheduleTimer(void) {
-    if (gTimer) return;
+// scheduledTimerWithTimeInterval attaches to the CALLING thread's runloop;
+// navigation-start callbacks can arrive on an engine thread whose runloop
+// never runs, silently killing the HUD tick. Always create the timer on the
+// main thread instead.
+static void CreateTickTimer(id self, SEL command, id argument) {
+    (void)self;
+    (void)command;
+    (void)argument;
+    if (gTimer || !gController) return;
     Class timerClass = C("NSTimer");
-    if (!timerClass || !gController) return;
+    if (!timerClass) return;
     gTimer = ((id (*)(id, SEL, double, id, SEL, id, BOOL))objc_msgSend)(
         (id)timerClass,
         S("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
         1.0, gController, S("dsh_tick:"), 0, YES);
 }
 
+static void ScheduleTimer(void) {
+    if (gTimer || !gController) return;
+    ((void (*)(id, SEL, SEL, id, BOOL))objc_msgSend)(
+        gController, S("performSelectorOnMainThread:withObject:waitUntilDone:"),
+        S("dsh_create_tick_timer:"), 0, NO);
+}
+
 static void Tick(id self, SEL command, id timer) {
     (void)self;
     (void)command;
     (void)timer;
+    static _Atomic double lastAlive;
+    double anow = WallSeconds();
+    if (anow - atomic_load_explicit(&lastAlive, memory_order_relaxed) > 15.0) {
+        atomic_store_explicit(&lastAlive, anow, memory_order_relaxed);
+        LogLine("tick alive overlay=%p", gOverlay);
+    }
     EnsureOverlay(KeyWindow());
     double monotonicNow = MonotonicSeconds();
     if (monotonicNow - atomic_load_explicit(
@@ -890,6 +927,8 @@ __attribute__((constructor)) static void AMapSignalCountdownInit(void) {
     }
     class_addMethod(controllerClass, S("dsh_start:"), (IMP)Start, "v@:@");
     class_addMethod(controllerClass, S("dsh_tick:"), (IMP)Tick, "v@:@");
+    class_addMethod(controllerClass, S("dsh_create_tick_timer:"),
+                    (IMP)CreateTickTimer, "v@:@");
     class_addMethod(controllerClass, S("dsh_background:"), (IMP)EnterBackground, "v@:@");
     class_addMethod(controllerClass, S("dsh_foreground:"), (IMP)EnterForeground, "v@:@");
     gController = MsgId((id)controllerClass, "new");
