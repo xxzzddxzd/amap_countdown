@@ -148,11 +148,6 @@ typedef void *(*SignalStatusSerializeFn)(void *model, void *serializer);
 typedef void *(*TravelStatusSerializeFn)(void *model, void *serializer);
 typedef void *(*TravelStatusArrayFn)(void *writer, void *unused,
                                      void *vector);
-typedef void *(*JsonWriteInt32Fn)(void *writer, const char *name,
-                                  int32_t value, void *extra);
-typedef void *(*JsonWriteInt64Fn)(void *writer, const char *name,
-                                  int64_t value);
-typedef void *(*BusPostFn)(void *bus, void *nameString, void *event);
 typedef void *(*PublishCountdownFn)(void *bus, void *event);
 typedef int (*ActiveTrafficRecordsFn)(void *records);
 typedef void *(*CyclingTimetableEvaluateFn)(void *context, void *phases,
@@ -169,9 +164,6 @@ typedef enum {
 static SignalStatusSerializeFn gOriginalSignalStatusSerialize;
 static TravelStatusSerializeFn gOriginalTravelStatusSerialize;
 static TravelStatusArrayFn gOriginalTravelStatusArray;
-static JsonWriteInt32Fn gOriginalJsonWriteInt32;
-static JsonWriteInt64Fn gOriginalJsonWriteInt64;
-static BusPostFn gOriginalBusPost;
 static PublishCountdownFn gOriginalPublishCountdown;
 static ActiveTrafficRecordsFn gOriginalActiveTrafficRecords;
 static CyclingTimetableEvaluateFn gOriginalCyclingTimetableEvaluate;
@@ -603,74 +595,6 @@ static void *HookTravelStatusArray(void *writer, void *unused, void *vector) {
     return result;
 }
 
-// Temporary diagnostic taps on the shared JSON field writers. Every model
-// serialization funnels through these two functions, so filtering by light
-// related field names exposes whichever component actually produces the
-// bike bubble data, together with its return address. To be removed once
-// the production site is identified.
-static int LightFieldName(const char *name) {
-    if (!PlausibleNativePointer((uintptr_t)name, 1)) return -1;
-    char c = name[0];
-    if (c != 'r' && c != 's' && c != 'c' && c != 'p' && c != 'l') return -1;
-    static const char *const kNames[] = {
-        "remainTime", "status",     "countDown", "countdown",
-        "passThrough", "lightStatus"};
-    for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); ++i)
-        if (strcmp(name, kNames[i]) == 0) return (int)i;
-    return -1;
-}
-
-static void *HookJsonWriteInt32(void *writer, const char *name,
-                                int32_t value, void *extra) {
-    static _Atomic double lastLogged;
-    double now = WallSeconds();
-    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 3.0 &&
-        LightFieldName(name) == 1 && value >= 0 && value <= 15) {
-        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
-        LogLine("json i32 %s=%d lr=%p", name, value,
-                __builtin_return_address(0));
-    }
-    return gOriginalJsonWriteInt32
-        ? gOriginalJsonWriteInt32(writer, name, value, extra) : 0;
-}
-
-static void *HookJsonWriteInt64(void *writer, const char *name,
-                                int64_t value) {
-    static _Atomic double lastLogged;
-    double now = WallSeconds();
-    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 3.0 &&
-        LightFieldName(name) == 0 && value > 0 && value < 3600) {
-        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
-        LogLine("json i64 %s=%lld lr=%p", name, (long long)value,
-                __builtin_return_address(0));
-    }
-    return gOriginalJsonWriteInt64
-        ? gOriginalJsonWriteInt64(writer, name, value) : 0;
-}
-
-// libc++ std::string reader (both SSO forms).
-static const char *StdStringChars(const void *str) {
-    const uint8_t *bytes = (const uint8_t *)str;
-    if (!PlausibleNativePointer((uintptr_t)str, 1)) return "";
-    if (!(bytes[0] & 1)) return (const char *)str;
-    const char *heap = 0;
-    memcpy(&heap, (const char *)str + 16, sizeof(heap));
-    return PlausibleNativePointer((uintptr_t)heap, 1) ? heap : "";
-}
-
-// Event-bus post tap: logs every distinct event name flowing through the
-// TBT event bus while navigating, exposing whichever channel actually
-// carries the live bike countdown.
-static void *HookBusPost(void *bus, void *nameString, void *event) {
-    static _Atomic double lastLogged;
-    double now = WallSeconds();
-    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 2.0) {
-        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
-        LogLine("bus post %s", StdStringChars(nameString));
-    }
-    return gOriginalBusPost ? gOriginalBusPost(bus, nameString, event) : 0;
-}
-
 // Cruise signal countdown publisher tap: dumps the raw event payload so the
 // field layout can be decoded against the visible bubble.
 static void *HookPublishCountdown(void *bus, void *event) {
@@ -712,15 +636,10 @@ static void InstallNativeHooks(void) {
          (void **)&gOriginalTravelStatusSerialize);
     hook((void *)(base + 0x0078856CULL), (void *)HookTravelStatusArray,
          (void **)&gOriginalTravelStatusArray);
-    // Shared JSON field writers (see hooks above).
-    hook((void *)(base + 0x104388B94ULL), (void *)HookJsonWriteInt32,
-         (void **)&gOriginalJsonWriteInt32);
-    hook((void *)(base + 0x104388BB4ULL), (void *)HookJsonWriteInt64,
-         (void **)&gOriginalJsonWriteInt64);
-    // TBT event bus taps.
-    hook((void *)(base + 0x1011EE5BCULL), (void *)HookBusPost,
-         (void **)&gOriginalBusPost);
-    hook((void *)(base + 0x1010FE0FCULL), (void *)HookPublishCountdown,
+    // Standard-ABI travel event publisher. Unlike the shared JSON/event-bus
+    // helpers, this function establishes its own x0/x1 frame and is safe for
+    // a plain C hook.
+    hook((void *)(base + 0x010FE0FCULL), (void *)HookPublishCountdown,
          (void **)&gOriginalPublishCountdown);
     {
         uint32_t prologue[4] = {0};
@@ -732,9 +651,9 @@ static void InstallNativeHooks(void) {
                sizeof(prologue));
         LogLine("prologue travel-array %08x %08x %08x %08x",
                 prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x104388B94ULL),
+        memcpy(prologue, (const void *)(base + 0x010FE0FCULL),
                sizeof(prologue));
-        LogLine("prologue json-i32 %08x %08x %08x %08x",
+        LogLine("prologue countdown-publish %08x %08x %08x %08x",
                 prologue[0], prologue[1], prologue[2], prologue[3]);
     }
     hook((void *)(base + 0x011FF8C0ULL), (void *)HookActiveTrafficRecords,
