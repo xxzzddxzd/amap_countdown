@@ -1,7 +1,7 @@
 SHELL := /var/jb/usr/bin/bash
 
 PACKAGE_ID := com.dsh.amapcycleassist
-PACKAGE_VERSION := 1.0.44
+PACKAGE_VERSION := 1.0.56
 CLANG ?= clang-16
 LDID ?= ldid
 DPKG_DEB ?= dpkg-deb
@@ -12,7 +12,7 @@ DYLIB := $(BUILD_DIR)/AMapCycleAssist.dylib
 DEB := $(BUILD_DIR)/$(PACKAGE_ID)_$(PACKAGE_VERSION)_iphoneos-arm64.deb
 INSTALL_NAME := /var/jb/Library/MobileSubstrate/DynamicLibraries/AMapCycleAssist.dylib
 
-CFLAGS := -target $(TARGET) -fobjc-runtime=ios-15.0 -std=gnu11 -O2 -Wall -Wextra -Werror
+CFLAGS := -target $(TARGET) -fobjc-runtime=ios-15.0 -std=gnu11 -O2 -Wall -Wextra -Werror -DDSH_PLUGIN_VERSION=\"$(PACKAGE_VERSION)\"
 LDFLAGS := -dynamiclib -Wl,-undefined,dynamic_lookup -Wl,-install_name,$(INSTALL_NAME) -lm
 
 .PHONY: all clean package inspect
@@ -22,8 +22,8 @@ all: $(DYLIB)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(DYLIB): Tweak.m | $(BUILD_DIR)
-	$(CLANG) $(CFLAGS) $(LDFLAGS) -o $@ $<
+$(DYLIB): Tweak.m AdviceStrategy.c AdviceStrategy.h Makefile | $(BUILD_DIR)
+	$(CLANG) $(CFLAGS) $(LDFLAGS) -o $@ Tweak.m AdviceStrategy.c
 	$(LDID) -S $@
 
 package: $(DYLIB) AMapCycleAssist.plist control

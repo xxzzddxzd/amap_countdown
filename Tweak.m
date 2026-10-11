@@ -1,7 +1,13 @@
 // AMap Signal Countdown — personal rootless tweak for AMap 16.11.1.
-// Reads only AMap's in-process native traffic-light state/countdown outputs.
-// No OCR, network interception, location/speed collection, distance inference,
-// or riding advice.
+// Reads only AMap's in-process native traffic-light, route-distance, and travel
+// speed outputs. No OCR, network interception, GPS/Core Location collection,
+// geospatial distance inference, or view-tree scanning.
+
+#include "AdviceStrategy.h"
+
+#ifndef DSH_PLUGIN_VERSION
+#define DSH_PLUGIN_VERSION "development"
+#endif
 
 #include <dlfcn.h>
 #include <math.h>
@@ -153,30 +159,24 @@ static void LogLine(const char *format, ...) {
 
 typedef void (*MSHookFunctionFn)(void *symbol, void *replacement, void **original);
 typedef void *(*SignalStatusSerializeFn)(void *model, void *serializer);
-typedef void *(*TravelStatusSerializeFn)(void *model, void *serializer);
-typedef void *(*TravelStatusArrayFn)(void *writer, void *unused,
-                                     void *vector);
+typedef void *(*SignalCountdownSerializeFn)(void *model, void *serializer);
 typedef void (*DynamicTrafficSignalUpdateFn)(void *processor, void *data,
                                              void *componentName);
-typedef void *(*TrafficSignalRenderUpdateFn)(void *controller,
-                                             void *trafficData,
-                                             void *navigationState);
-typedef uintptr_t (*RouteDistanceEnvelopeFn)(void *context, void *previous,
-                                             void *current, void *extra);
-typedef uintptr_t (*RouteDistanceContextFn)(void *context);
-typedef uintptr_t (*GuideLightDistanceBuildFn)(void *formatter, void *route,
-                                               uintptr_t index);
-typedef uintptr_t (*GuideLightDistanceFormatFn)(void *formatter);
-typedef uintptr_t (*FirstLightStatsSerializeFn)(uint32_t *stats,
-                                                void *serializer);
-typedef uintptr_t (*RouteSummarySerializeFn)(void *summary,
-                                             void *serializer);
 typedef uintptr_t (*ActiveTravelSignalRouteFn)(void *processor, void *signals,
                                                void *navigationState);
 typedef int (*ActiveTrafficRecordsFn)(void *records);
-typedef void *(*CyclingTimetableEvaluateFn)(void *context, void *phases,
-                                            uint64_t currentTime, void *outA,
-                                            void *outB, int32_t mode);
+typedef uintptr_t (*CarTrafficInputFn)(void *processor, const void *feed,
+                                       const void *navigationState);
+typedef int64_t (*TravelLocationUpdateFn)(void *service,
+                                          const void *locationInfo,
+                                          int32_t pointType);
+typedef uintptr_t (*TravelRouteForTypeFn)(void *routes, int32_t routeType);
+typedef int64_t (*TravelNaviInfoSerializeFn)(const uint8_t *info,
+                                             void *writer);
+typedef int32_t (*TravelRecommendSpeedFn)(void *provider, void *phases,
+                                            uint32_t distanceMeters,
+                                            int64_t currentTimeSeconds,
+                                            int32_t averageSpeedKmh, int32_t maximumWindows);
 
 typedef enum {
     LampUnknown = 0,
@@ -185,63 +185,120 @@ typedef enum {
     LampGreen
 } LampState;
 
+typedef enum {
+    CountdownSourceUnknown = 0,
+    CountdownSourceCar,
+    CountdownSourceTravel,
+    CountdownSourceCarInput
+} CountdownSource;
+
+static BOOL IsCarCountdownSource(CountdownSource source) {
+    return source == CountdownSourceCar || source == CountdownSourceCarInput;
+}
+
 static SignalStatusSerializeFn gOriginalSignalStatusSerialize;
-static TravelStatusSerializeFn gOriginalTravelStatusSerialize;
-static TravelStatusArrayFn gOriginalTravelStatusArray;
+static SignalCountdownSerializeFn gOriginalSignalCountdownSerialize;
 static DynamicTrafficSignalUpdateFn gOriginalDynamicTrafficSignalUpdate;
-static TrafficSignalRenderUpdateFn gOriginalTrafficSignalRenderUpdate;
-static RouteDistanceEnvelopeFn gOriginalRouteDistanceEnvelope;
-static RouteDistanceContextFn gOriginalRouteDistanceContext;
-static GuideLightDistanceBuildFn gOriginalGuideLightDistanceBuild;
-static GuideLightDistanceFormatFn gOriginalGuideLightDistanceFormatA;
-static GuideLightDistanceFormatFn gOriginalGuideLightDistanceFormatB;
-static FirstLightStatsSerializeFn gOriginalFirstLightStatsSerialize;
-static RouteSummarySerializeFn gOriginalRouteSummarySerializeA;
-static RouteSummarySerializeFn gOriginalRouteSummarySerializeB;
 static ActiveTravelSignalRouteFn gOriginalActiveTravelSignalRoute;
 static ActiveTrafficRecordsFn gOriginalActiveTrafficRecords;
-static CyclingTimetableEvaluateFn gOriginalCyclingTimetableEvaluate;
+static CarTrafficInputFn gOriginalCarTrafficInput;
+static TravelLocationUpdateFn gOriginalTravelLocationUpdate;
+static TravelRouteForTypeFn gTravelRouteForType;
+static TravelNaviInfoSerializeFn gOriginalTravelNaviInfoSerialize;
+static TravelRecommendSpeedFn gOriginalTravelRecommendSpeed;
 static _Atomic int gNativeStatus = -1;
+static _Atomic int gSerializedCarStatus = -1;
+static _Atomic int64_t gSerializedCarRemainSeconds = -1;
+static _Atomic double gSerializedCarCapturedAt;
+static _Atomic double gSerializedCarUpdatedAt;
 static _Atomic LampState gLampState = LampUnknown;
+static _Atomic CountdownSource gCountdownSource = CountdownSourceUnknown;
 static _Atomic double gPhaseEndMonotonic;
 static _Atomic double gTimetableUpdatedAt;
 static _Atomic double gCarUpdatedAt;
+#define kMaxCarPhases 64
+#define kCarTableBusy 0x8000000000000000ULL
+static _Atomic uint64_t gCarTable[kMaxCarPhases * 3 + 1];
+static atomic_flag gCarTableWriteLock = ATOMIC_FLAG_INIT;
+static _Atomic double gCarTableCapturedAt;
+static _Atomic uint64_t gCarTableSignalId;
+static _Atomic int gCarTableYellowSeconds = -1;
+// Diagnostic metadata only; never used to extend or select a cached light.
+static _Atomic(const char *) gCarCaptureReason = "no-record";
+static _Atomic uint64_t gCarCaptureSignalId;
+static _Atomic int gCarCaptureCurrentStatus = -1;
+static _Atomic double gCarCaptureAt;
+// Main-thread publisher rejection reasons, included when the HUD becomes --.
+static const char *gCarTableRejectReason = "not-evaluated";
+static const char *gCarSerializedRejectReason = "not-evaluated";
+static const char *gRawCarRejectReason = "not-evaluated";
+
+// Native input before the car overlay's distance/lifecycle filter. The latest
+// begun observation wins, including empty/unsupported input. Copy under a
+// short lock so ARM64 readers cannot combine identity and phases from different
+// callbacks. No pointers, coordinates, or simulated locations are retained.
+typedef enum {
+    RawCarNoInput = 0,
+    RawCarInvalidInput,
+    RawCarEmpty,
+    RawCarNoUpcoming,
+    RawCarAmbiguous,
+    RawCarMissingIdentity,
+    RawCarUnsupported,
+    RawCarNoPhases,
+    RawCarInvalidPhases,
+    RawCarReady
+} RawCarInputState;
+
+typedef struct {
+    double capturedAt;
+    uint64_t observation;
+    uint64_t signalId;
+    RawCarInputState state;
+    int distanceMeters;
+    int displayLimit;
+    int yellowSeconds;
+    unsigned inputCount;
+    int eligibleFlag;
+    int currentOffset;
+    int targetOffset;
+    unsigned phaseCount;
+    uint64_t phases[kMaxCarPhases * 3];
+} RawCarInputSnapshot;
+
+static BOOL LoadRawCarInput(RawCarInputSnapshot *snapshot);
+static BOOL LoadCurrentCarTarget(uint64_t *signalId, const char **reason,
+                                 RawCarInputSnapshot *snapshotOut);
+static BOOL CommitIdentifiedCarDisplay(const RawCarInputSnapshot *snapshot,
+                                      LampState state, double phaseEnd,
+                                      unsigned expectedDisplayGeneration,
+                                      CountdownSource source);
+
+static RawCarInputSnapshot gRawCarInput;
+static _Atomic uint64_t gRawCarObservationSequence;
+static atomic_flag gRawCarInputLock = ATOMIC_FLAG_INIT;
+
+typedef struct {
+    const char *reason;
+    int recordFlag;
+    int currentStatus;
+    int nextStatus;
+    int64_t nativeRemaining;
+    int phaseCode;
+    unsigned phaseCount;
+    double phaseRemaining;
+    BOOL oldGateMismatch;
+} CarCaptureDiagnostic;
+
 static _Atomic unsigned gTrafficSignalGeneration;
 static _Atomic unsigned gTrafficSignalOuterCount;
 static _Atomic unsigned gTrafficSignalInnerCount;
 static _Atomic unsigned gTrafficSignalPhaseCount;
 static _Atomic unsigned gTrafficSignalPublishedCount;
 static _Atomic uint64_t gTrafficSignalPhaseRows[12];
-static _Atomic unsigned gSignalDistanceGeneration;
-static _Atomic unsigned gSignalDistanceCandidateCount;
-static _Atomic int gSignalDistanceMeters = -1;
-static _Atomic int gSignalDistanceCurrentOffset;
-static _Atomic int gSignalDistanceTargetOffset;
-static _Atomic uint64_t gSignalDistanceLinkId;
-static _Atomic uint32_t gSignalDistanceCurrentLink;
-static _Atomic double gSignalDistanceUpdatedAt;
-static _Atomic unsigned gRouteDistanceGeneration;
-static _Atomic int gRouteDistanceEnvelopeMeters = -1;
-static _Atomic int gRouteDistanceContextMeters = -1;
-static _Atomic uintptr_t gRouteDistanceEnvelopeObject;
-static _Atomic uintptr_t gRouteDistanceContextObject;
-static _Atomic double gRouteDistanceUpdatedAt;
-static _Atomic unsigned gGuideLightBuildGeneration;
-static _Atomic unsigned gGuideLightFormatGeneration;
-static _Atomic int gGuideLightDistanceMeters = -1;
-static _Atomic int gGuideLightDistanceBefore = -1;
-static _Atomic int gGuideLightRouteBase = -1;
-static _Atomic int gGuideLightRouteMode = -1;
-static _Atomic uintptr_t gGuideLightRouteIndex;
-static _Atomic double gGuideLightUpdatedAt;
-static _Atomic unsigned gFirstLightStatsGeneration;
-static _Atomic int gFirstLightTotalCount = -1;
-static _Atomic int gFirstLightDistanceMeters = -1;
-static _Atomic int gFirstLightTimeSeconds = -1;
-static _Atomic unsigned gRouteSummaryGeneration;
-static _Atomic int gRouteSummaryEtaDistance = -1;
-static _Atomic int gRouteSummaryEtaTime = -1;
-static _Atomic int gRouteSummaryRemainingLights = -1;
+static _Atomic uint64_t gCyclingTableSignalId;
+static _Atomic double gCyclingTableUpdatedAt;
+
 static _Atomic unsigned gActiveSignalRouteGeneration;
 static _Atomic unsigned gActiveSignalRouteCandidateCount;
 static _Atomic int gActiveSignalRouteDistance = -1;
@@ -250,16 +307,52 @@ static _Atomic int gActiveSignalTargetOffset = -1;
 static _Atomic int gActiveSignalRangeEnd = -1;
 static _Atomic uint64_t gActiveSignalRouteId;
 static _Atomic double gActiveSignalRouteUpdatedAt;
+static _Atomic unsigned gTravelNaviInfoGeneration;
+static _Atomic int gTravelCurrentSpeedKmh = -1;
+static _Atomic int gTravelMode = -1;
+static _Atomic int gTravelNavigationStatus = -1;
+static _Atomic double gTravelNaviInfoUpdatedAt;
+static _Atomic int gTravelAdviceDistanceMeters = -1;
+static _Atomic int gTravelAverageSpeedKmh = -1;
+static _Atomic int gTravelNativeRecommendedSpeedKmh = -1;
 static atomic_flag gDisplayWriteLock = ATOMIC_FLAG_INIT;
 static _Atomic unsigned gDisplayGeneration;
 // Seqlock-protected snapshot of the native bicycle phase table written by
-// HookCyclingTimetableEvaluate on the GNaviTravel thread and read by the HUD
+// HookTravelRecommendSpeed on the GNaviTravel thread and read by the HUD
 // timer on the main thread. Header word: bit 63 is the busy flag, bits 8..62
 // the generation, bits 0..7 the record count; payload is count triples of
 // {code, startsAt, endsAt} in absolute epoch seconds.
 #define kMaxCyclingPhases 32
 #define kCyclingTableBusy 0x8000000000000000ULL
 static _Atomic uint64_t gCyclingTable[kMaxCyclingPhases * 3 + 1];
+
+#define kTravelAdviceSnapshotBusy 0x8000000000000000ULL
+#define kTravelAdviceSnapshotRows 8
+static _Atomic uint64_t gTravelAdviceSnapshot[
+    kTravelAdviceSnapshotRows + kMaxCyclingPhases * 3];
+static atomic_flag gTravelAdviceSnapshotWriteLock = ATOMIC_FLAG_INIT;
+
+typedef struct {
+    double capturedAt;
+    uint64_t signalId;
+    int distanceMeters;
+    int averageSpeedKmh;
+    int nativeRecommendedSpeedKmh;
+    int maximumWindows;
+    int64_t currentTimeSeconds;
+    uint32_t phaseCount;
+    uint64_t phaseRows[kMaxCyclingPhases * 3];
+} TravelAdviceSnapshot;
+
+typedef struct {
+    unsigned candidateCount;
+    int distanceMeters;
+    int currentOffset;
+    int targetOffset;
+    int rangeEnd;
+    uint64_t signalId;
+    double updatedAt;
+} ActiveSignalSnapshot;
 static id gController;
 static id gTimer;
 static id gBall;
@@ -270,7 +363,13 @@ static id gFullView;
 static id gFullLampLabel;
 static id gFullSecondsLabel;
 static id gFullUnitLabel;
+static id gFullSpeedLabel;
+static id gFullAdviceActionLabel;
+static id gFullAdviceDetailLabel;
 static id gFullDisclaimerLabel;
+static double gPreferredAdviceWindowStart;
+static uint64_t gAdviceSignalId;
+static AdviceStabilizer gAdviceStabilizer;
 static BOOL gExpanded;
 static BOOL gBallPositioned;
 static CGFloat gFullNumberLayoutWidth;
@@ -291,6 +390,50 @@ static uintptr_t AMapMainImageBase(void) {
             return (uintptr_t)_dyld_get_image_header(index);
     }
     return 0;
+}
+
+static uint64_t DoubleToBits(double value) {
+    uint64_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static double BitsToDouble(uint64_t bits) {
+    double value = 0.0;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static BOOL LoadActiveSignalSnapshot(ActiveSignalSnapshot *snapshot) {
+    if (!snapshot) return NO;
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        unsigned before = atomic_load_explicit(
+            &gActiveSignalRouteGeneration, memory_order_acquire);
+        if (before & 1U) continue;
+        ActiveSignalSnapshot value = {
+            .candidateCount = atomic_load_explicit(
+                &gActiveSignalRouteCandidateCount, memory_order_relaxed),
+            .distanceMeters = atomic_load_explicit(
+                &gActiveSignalRouteDistance, memory_order_relaxed),
+            .currentOffset = atomic_load_explicit(
+                &gActiveSignalCurrentOffset, memory_order_relaxed),
+            .targetOffset = atomic_load_explicit(
+                &gActiveSignalTargetOffset, memory_order_relaxed),
+            .rangeEnd = atomic_load_explicit(
+                &gActiveSignalRangeEnd, memory_order_relaxed),
+            .signalId = atomic_load_explicit(
+                &gActiveSignalRouteId, memory_order_relaxed),
+            .updatedAt = atomic_load_explicit(
+                &gActiveSignalRouteUpdatedAt, memory_order_relaxed),
+        };
+        unsigned after = atomic_load_explicit(
+            &gActiveSignalRouteGeneration, memory_order_acquire);
+        if (before == after && !(after & 1U)) {
+            *snapshot = value;
+            return after != 0;
+        }
+    }
+    return NO;
 }
 
 // Car-navigation model mappings verified on AMap 16.11.1.
@@ -318,38 +461,33 @@ static LampState LampForCyclingPhase(int code) {
     return LampUnknown;
 }
 
-static void PublishDisplayState(LampState state, double phaseEnd, double updatedAt) {
+static void PublishDisplayState(LampState state, double phaseEnd,
+                                double updatedAt, CountdownSource source) {
     while (atomic_flag_test_and_set_explicit(
                &gDisplayWriteLock, memory_order_acquire)) {}
     unsigned generation = atomic_load_explicit(
         &gDisplayGeneration, memory_order_relaxed);
     atomic_store_explicit(&gDisplayGeneration, generation + 1U, memory_order_release);
     atomic_store_explicit(&gLampState, state, memory_order_relaxed);
+    atomic_store_explicit(&gCountdownSource, source, memory_order_relaxed);
     atomic_store_explicit(&gPhaseEndMonotonic, phaseEnd, memory_order_relaxed);
     atomic_store_explicit(&gTimetableUpdatedAt, updatedAt, memory_order_relaxed);
     atomic_store_explicit(&gDisplayGeneration, generation + 2U, memory_order_release);
     atomic_flag_clear_explicit(&gDisplayWriteLock, memory_order_release);
 }
 
-static BOOL LoadDisplayState(LampState *state, double *phaseEnd, double *updatedAt) {
-    for (unsigned attempt = 0; attempt < 3; attempt++) {
-        unsigned generationBefore = atomic_load_explicit(
-            &gDisplayGeneration, memory_order_acquire);
-        if (generationBefore & 1U) continue;
-        LampState localState = atomic_load_explicit(&gLampState, memory_order_relaxed);
-        double localEnd = atomic_load_explicit(
-            &gPhaseEndMonotonic, memory_order_relaxed);
-        double localUpdated = atomic_load_explicit(
-            &gTimetableUpdatedAt, memory_order_relaxed);
-        unsigned generationAfter = atomic_load_explicit(
-            &gDisplayGeneration, memory_order_acquire);
-        if (generationBefore != generationAfter || (generationAfter & 1U)) continue;
-        *state = localState;
-        *phaseEnd = localEnd;
-        *updatedAt = localUpdated;
-        return YES;
-    }
-    return NO;
+static BOOL LoadDisplayState(LampState *state, double *phaseEnd,
+                             double *updatedAt, CountdownSource *source) {
+    // Use the same short lock as publishers and source-conditional clearing;
+    // the lamp, source, expiry, and capture time must be one ARM64 snapshot.
+    while (atomic_flag_test_and_set_explicit(&gDisplayWriteLock,
+                                             memory_order_acquire)) {}
+    *state = atomic_load_explicit(&gLampState, memory_order_relaxed);
+    *phaseEnd = atomic_load_explicit(&gPhaseEndMonotonic, memory_order_relaxed);
+    *updatedAt = atomic_load_explicit(&gTimetableUpdatedAt, memory_order_relaxed);
+    *source = atomic_load_explicit(&gCountdownSource, memory_order_relaxed);
+    atomic_flag_clear_explicit(&gDisplayWriteLock, memory_order_release);
+    return YES;
 }
 
 static BOOL LoadCyclingTable(uint64_t *out, uint32_t *outCount) {
@@ -371,10 +509,75 @@ static BOOL LoadCyclingTable(uint64_t *out, uint32_t *outCount) {
     return NO;
 }
 
+static BOOL LoadTaggedCyclingTable(uint64_t *rows, uint32_t *count,
+                                   uint64_t *signalId) {
+    if (!rows || !count || !signalId) return NO;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        unsigned before = atomic_load_explicit(
+            &gTrafficSignalGeneration, memory_order_acquire);
+        if (!before) return NO;
+        unsigned outerCount = atomic_load_explicit(
+            &gTrafficSignalOuterCount, memory_order_relaxed);
+        unsigned innerCount = atomic_load_explicit(
+            &gTrafficSignalInnerCount, memory_order_relaxed);
+        uint64_t localSignalId = atomic_load_explicit(
+            &gCyclingTableSignalId, memory_order_relaxed);
+        uint32_t localCount = 0;
+        if (outerCount != 1 || innerCount != 1 || !localSignalId ||
+            !LoadCyclingTable(rows, &localCount) || !localCount)
+            return NO;
+        unsigned after = atomic_load_explicit(
+            &gTrafficSignalGeneration, memory_order_acquire);
+        if (before == after) {
+            *count = localCount;
+            *signalId = localSignalId;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+#define kMaxAdviceGreenWindows 16
+
+static size_t BuildAdviceGreenWindows(const uint64_t *rows,
+                                      uint32_t count,
+                                      double wallNow,
+                                      AdviceGreenWindow *windows,
+                                      size_t capacity) {
+    if (!rows || !count || !windows || !capacity) return 0;
+    size_t kept = 0;
+    for (uint32_t index = 0; index < count; ++index) {
+        int32_t code = (int32_t)(uint32_t)rows[index * 3];
+        double startsAt = (double)(int64_t)rows[index * 3 + 1];
+        double endsAt = (double)(int64_t)rows[index * 3 + 2];
+        if (LampForCyclingPhase(code) != LampGreen || endsAt <= wallNow ||
+            startsAt <= 0.0 || endsAt <= startsAt)
+            continue;
+        if (kept && startsAt <= windows[kept - 1].endEpochSeconds + 0.5) {
+            if (endsAt > windows[kept - 1].endEpochSeconds)
+                windows[kept - 1].endEpochSeconds = endsAt;
+            continue;
+        }
+        if (kept == capacity) break;
+        windows[kept++] = (AdviceGreenWindow){
+            .startEpochSeconds = startsAt,
+            .endEpochSeconds = endsAt,
+        };
+    }
+    return kept;
+}
+
 static BOOL PublishLiveCyclingPhase(double wallNow, double monotonicNow) {
+    ActiveSignalSnapshot active = {0};
     uint64_t rows[kMaxCyclingPhases * 3];
     uint32_t count = 0;
-    if (!LoadCyclingTable(rows, &count) || !count) return NO;
+    uint64_t tableSignalId = 0;
+    if (!LoadActiveSignalSnapshot(&active) || active.candidateCount != 1 ||
+        !active.signalId || wallNow - active.updatedAt < 0.0 ||
+        wallNow - active.updatedAt > 2.5 ||
+        !LoadTaggedCyclingTable(rows, &count, &tableSignalId) ||
+        tableSignalId != active.signalId)
+        return NO;
 
     int64_t now = (int64_t)wallNow;
     LampState state = LampUnknown;
@@ -428,7 +631,8 @@ static BOOL PublishLiveCyclingPhase(double wallNow, double monotonicNow) {
         atomic_store_explicit(&lastWalkHit, wnow, memory_order_relaxed);
         LogLine("walk hit state=%d remain=%.0f", (int)state, remaining);
     }
-    PublishDisplayState(state, monotonicNow + remaining, monotonicNow);
+    PublishDisplayState(state, monotonicNow + remaining, monotonicNow,
+                        CountdownSourceTravel);
     return YES;
 }
 
@@ -450,88 +654,401 @@ static void *HookSignalStatusSerialize(void *model, void *serializer) {
         ? gOriginalSignalStatusSerialize(model, serializer) : 0;
 }
 
-static BOOL PublishCurrentCarTimetable(const unsigned char *record,
-                                       double wallNow, double monotonicNow,
-                                       int nativeStatus,
-                                       int64_t *publishedEnd) {
-    if (!record || !PlausibleNativePointer((uintptr_t)record, 8)) return NO;
-    uintptr_t containerBegin = 0, containerEnd = 0;
-    memcpy(&containerBegin, record + 0x28, sizeof(containerBegin));
-    memcpy(&containerEnd, record + 0x30, sizeof(containerEnd));
-    if (!PlausibleNativeRange(containerBegin, containerEnd, 4096, 8) ||
-        containerEnd - containerBegin < 0x20)
-        return NO;
+// Official drive/cruise countdown JSON model. This sibling serializer carries
+// the exact status and remainTime already rendered by AMap's own map UI.
+static void *HookSignalCountdownSerialize(void *model, void *serializer) {
+    if (model) {
+        int32_t status = -1;
+        int64_t remainSeconds = -1;
+        memcpy(&status, (const unsigned char *)model + 0x08,
+               sizeof(status));
+        memcpy(&remainSeconds, (const unsigned char *)model + 0x10,
+               sizeof(remainSeconds));
+        double wallNow = WallSeconds();
+        if (status >= 0 && status <= 20 && remainSeconds >= 0 &&
+            remainSeconds <= 999) {
+            atomic_store_explicit(&gSerializedCarStatus, status,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&gSerializedCarRemainSeconds,
+                                  remainSeconds, memory_order_relaxed);
+            atomic_store_explicit(&gSerializedCarCapturedAt,
+                                  MonotonicSeconds(), memory_order_relaxed);
+            atomic_store_explicit(&gSerializedCarUpdatedAt, wallNow,
+                                  memory_order_release);
+        }
+        static _Atomic int lastStatus = -999;
+        static _Atomic int64_t lastRemain = -999;
+        int priorStatus = atomic_load_explicit(&lastStatus,
+                                               memory_order_relaxed);
+        int64_t priorRemain = atomic_load_explicit(&lastRemain,
+                                                   memory_order_relaxed);
+        if (status != priorStatus || remainSeconds != priorRemain) {
+            atomic_store_explicit(&lastStatus, status, memory_order_relaxed);
+            atomic_store_explicit(&lastRemain, remainSeconds,
+                                  memory_order_relaxed);
+            LogLine("signal countdown serializer status=%d remain=%lld",
+                    status, (long long)remainSeconds);
+        }
+    }
+    return gOriginalSignalCountdownSerialize
+        ? gOriginalSignalCountdownSerialize(model, serializer) : 0;
+}
 
-    for (uintptr_t container = containerBegin;
-         container <= containerEnd - 0x20; container += 80) {
-        uintptr_t phaseBegin = 0, phaseEnd = 0;
-        memcpy(&phaseBegin, (const void *)(container + 0x10), sizeof(phaseBegin));
-        memcpy(&phaseEnd, (const void *)(container + 0x18), sizeof(phaseEnd));
-        if (!PlausibleNativeRange(phaseBegin, phaseEnd, 24 * 64, 8) ||
-            phaseEnd - phaseBegin < 24 ||
-            (phaseEnd - phaseBegin) % 24 != 0)
+static size_t PublishCarPhaseRange(uintptr_t begin, uintptr_t end,
+                                   double capturedAt, uint64_t signalId,
+                                   int yellowSeconds) {
+    if (!PlausibleNativeRange(begin, end, kMaxCarPhases * 24, 8) ||
+        end <= begin || (end - begin) % 24 != 0)
+        return 0;
+    size_t count = (size_t)(end - begin) / 24;
+    uint64_t rows[kMaxCarPhases * 3];
+    size_t kept = 0;
+    for (size_t index = 0; index < count; ++index) {
+        const unsigned char *phase =
+            (const unsigned char *)(begin + index * 24);
+        int32_t code = 0;
+        int64_t startsAt = 0, endsAt = 0;
+        memcpy(&code, phase, sizeof(code));
+        memcpy(&startsAt, phase + 8, sizeof(startsAt));
+        memcpy(&endsAt, phase + 16, sizeof(endsAt));
+        if ((code != 1 && code != 11 && code != 30) || startsAt <= 0 ||
+            endsAt <= startsAt || endsAt - startsAt > 999)
             continue;
+        rows[kept * 3] = (uint32_t)code;
+        rows[kept * 3 + 1] = (uint64_t)startsAt;
+        rows[kept * 3 + 2] = (uint64_t)endsAt;
+        kept++;
+    }
+    if (!kept) return 0;
 
-        size_t phaseCount = (size_t)(phaseEnd - phaseBegin) / 24;
-        for (size_t phaseIndex = 0; phaseIndex < phaseCount; phaseIndex++) {
-            const unsigned char *phase =
-                (const unsigned char *)(phaseBegin + phaseIndex * 24);
-            int32_t phaseCode = 0;
-            int64_t startsAt = 0, endsAt = 0;
-            memcpy(&phaseCode, phase, sizeof(phaseCode));
-            memcpy(&startsAt, phase + 8, sizeof(startsAt));
-            memcpy(&endsAt, phase + 16, sizeof(endsAt));
-            if (startsAt < 0 || endsAt <= startsAt ||
-                endsAt - startsAt > 180 || wallNow < (double)startsAt ||
-                wallNow >= (double)endsAt ||
-                !PhaseCodeMatchesNative(phaseCode, nativeStatus))
-                continue;
+    while (atomic_flag_test_and_set_explicit(
+               &gCarTableWriteLock, memory_order_acquire)) {}
+    uint64_t header = atomic_load_explicit(&gCarTable[0],
+                                            memory_order_relaxed);
+    atomic_store_explicit(&gCarTable[0], header | kCarTableBusy,
+                          memory_order_relaxed);
+    for (size_t index = 0; index < kept * 3; ++index)
+        atomic_store_explicit(&gCarTable[1 + index], rows[index],
+                              memory_order_relaxed);
+    atomic_store_explicit(&gCarTableCapturedAt, capturedAt,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gCarTableSignalId, signalId,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gCarTableYellowSeconds, yellowSeconds,
+                          memory_order_relaxed);
+    atomic_store_explicit(
+        &gCarTable[0],
+        ((header + 0x100ULL) & ~(kCarTableBusy | 0xffULL)) | kept,
+        memory_order_release);
+    atomic_flag_clear_explicit(&gCarTableWriteLock, memory_order_release);
+    return kept;
+}
 
-            LampState state = LampForNativeStatus(nativeStatus, phaseCode);
-            if (state == LampUnknown) continue;
-            PublishDisplayState(
-                state, monotonicNow + ((double)endsAt - wallNow),
-                monotonicNow);
-            atomic_store_explicit(
-                &gCarUpdatedAt, monotonicNow, memory_order_release);
-            if (publishedEnd) *publishedEnd = endsAt;
+static BOOL LoadCarTable(uint64_t *rows, uint32_t *count,
+                         double *capturedAt, uint64_t *signalId,
+                         int *yellowSeconds) {
+    if (!rows || !count || !capturedAt || !signalId || !yellowSeconds) return NO;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        uint64_t header = atomic_load_explicit(&gCarTable[0],
+                                               memory_order_acquire);
+        if (header & kCarTableBusy) continue;
+        uint32_t localCount = (uint32_t)(header & 0xffULL);
+        if (!localCount || localCount > kMaxCarPhases) return NO;
+        for (uint32_t index = 0; index < localCount * 3; ++index)
+            rows[index] = atomic_load_explicit(&gCarTable[1 + index],
+                                               memory_order_relaxed);
+        double localCapturedAt = atomic_load_explicit(
+            &gCarTableCapturedAt, memory_order_relaxed);
+        uint64_t localSignalId = atomic_load_explicit(
+            &gCarTableSignalId, memory_order_relaxed);
+        int localYellowSeconds = atomic_load_explicit(
+            &gCarTableYellowSeconds, memory_order_relaxed);
+        uint64_t check = atomic_load_explicit(&gCarTable[0],
+                                              memory_order_acquire);
+        if (check == header) {
+            *count = localCount;
+            *capturedAt = localCapturedAt;
+            *signalId = localSignalId;
+            *yellowSeconds = localYellowSeconds;
             return YES;
         }
     }
     return NO;
 }
 
+static BOOL PublishSerializedCarCountdown(double wallNow,
+                                             double monotonicNow) {
+    (void)wallNow;
+    (void)monotonicNow;
+    // This model has no verified signal ID. Keep observing it for diagnostics,
+    // but it must not overwrite a countdown selected for a known intersection.
+    gCarSerializedRejectReason = atomic_load_explicit(
+        &gSerializedCarUpdatedAt, memory_order_acquire) > 0.0
+        ? "unidentified-serialized-signal" : "no-sample";
+    return NO;
+}
+
+static BOOL PublishLiveCarPhase(double wallNow, double monotonicNow,
+                                unsigned expectedDisplayGeneration) {
+    gCarTableRejectReason = "cache-empty-or-busy";
+    uint64_t rows[kMaxCarPhases * 3];
+    uint32_t count = 0;
+    double capturedAt = 0.0;
+    uint64_t tableSignalId = 0;
+    double tableAge = 0.0;
+    int yellowSeconds = -1;
+    RawCarInputSnapshot rawTarget = {0};
+    if (!LoadCarTable(rows, &count, &capturedAt, &tableSignalId, &yellowSeconds))
+        return NO;
+    tableAge = monotonicNow - capturedAt;
+    gCarTableRejectReason = "clock-invalid";
+    if (!isfinite(tableAge) || tableAge < 0.0) return NO;
+
+    ActiveSignalSnapshot active = {0};
+    BOOL activeTravelSignal = LoadActiveSignalSnapshot(&active) &&
+        active.candidateCount == 1 && active.signalId != 0 &&
+        wallNow - active.updatedAt >= 0.0 &&
+        wallNow - active.updatedAt <= 2.5;
+    double travelAge = wallNow - atomic_load_explicit(
+        &gTravelNaviInfoUpdatedAt, memory_order_relaxed);
+    BOOL travelActive = travelAge >= 0.0 && travelAge <= 2.5;
+    if (activeTravelSignal) {
+        // A car timetable may bridge a mode switch only for the exact same
+        // physical signal ID and only within a short prediction horizon.
+        gCarTableRejectReason = "travel-id-mismatch";
+        if (tableSignalId != active.signalId) return NO;
+        gCarTableRejectReason = "bridge-age-120s";
+        if (tableAge > 120.0) return NO;
+    } else {
+        // Keep the existing identity and age limits. Fix capture, rather than
+        // allowing an unrefreshed previous light to survive these safeguards.
+        gCarTableRejectReason = "travel-without-signal";
+        if (travelActive) return NO;
+        uint64_t currentCarSignalId = 0;
+        if (!LoadCurrentCarTarget(&currentCarSignalId, &gCarTableRejectReason,
+                                  &rawTarget)) return NO;
+        gCarTableRejectReason = "current-car-id-mismatch";
+        if (tableSignalId != currentCarSignalId) return NO;
+        gCarTableRejectReason = "cache-age-15s";
+        if (tableAge > 15.0) return NO;
+    }
+
+    gCarTableRejectReason = "no-current-phase";
+    int64_t now = (int64_t)wallNow;
+    for (uint32_t index = 0; index < count; ++index) {
+        int32_t code = (int32_t)(uint32_t)rows[index * 3];
+        int64_t startsAt = (int64_t)rows[index * 3 + 1];
+        int64_t endsAt = (int64_t)rows[index * 3 + 2];
+        if (startsAt > now || now >= endsAt) continue;
+        // Color and yellow threshold belong to this identified signal, never
+        // to the untagged global status serializer (which can describe another).
+        LampState state = LampForNativeStatus(-1, code);
+        if (state == LampUnknown) continue;
+        double remaining = (double)endsAt - wallNow;
+        if (state == LampGreen && yellowSeconds >= 0 && remaining <= yellowSeconds)
+            state = LampYellow;
+        if (activeTravelSignal) {
+            PublishDisplayState(state, monotonicNow + remaining, monotonicNow,
+                                CountdownSourceCar);
+        } else if (!CommitIdentifiedCarDisplay(&rawTarget, state,
+                    monotonicNow + remaining, expectedDisplayGeneration,
+                    CountdownSourceCar)) {
+            gCarTableRejectReason = "car-target-changed-at-commit";
+            return NO;
+        }
+        gCarTableRejectReason = "ready";
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL PublishCurrentCarTimetable(const unsigned char *record,
+                                       double wallNow, double monotonicNow,
+                                       uint64_t signalId,
+                                       CarCaptureDiagnostic *diagnostic) {
+    diagnostic->reason = "invalid-record";
+    if (!record || !PlausibleNativePointer((uintptr_t)record, 8)) return NO;
+    memcpy(&diagnostic->recordFlag, record + 0x54, sizeof(int32_t));
+    uintptr_t containerBegin = 0, containerEnd = 0;
+    memcpy(&containerBegin, record + 0x28, sizeof(containerBegin));
+    memcpy(&containerEnd, record + 0x30, sizeof(containerEnd));
+    diagnostic->reason = "invalid-or-empty-lights";
+    if (!PlausibleNativeRange(containerBegin, containerEnd, 4096, 8) ||
+        containerEnd - containerBegin < 80 ||
+        (containerEnd - containerBegin) % 80 != 0)
+        return NO;
+
+    // Native car HUD uses only lights.begin. 0x101200DDC updates CURRENT
+    // status at +0x38 and remaining int64 seconds at +0x40 on every tick.
+    // 0x101201398 starts at the NEXT phase row and writes +0x28/+0x30.
+    // Comparing today's phase to +0x28 was rejecting valid current lights.
+    uintptr_t container = containerBegin;
+    int32_t engineStatus = -1, nextStatus = -1, yellowSeconds = -1;
+    int64_t nativeRemaining = -1;
+    memcpy(&yellowSeconds, (const void *)(container + 8), sizeof(yellowSeconds));
+    memcpy(&engineStatus, (const void *)(container + 0x38), sizeof(engineStatus));
+    memcpy(&nextStatus, (const void *)(container + 0x28), sizeof(nextStatus));
+    memcpy(&nativeRemaining, (const void *)(container + 0x40),
+           sizeof(nativeRemaining));
+    diagnostic->currentStatus = engineStatus;
+    diagnostic->nextStatus = nextStatus;
+    diagnostic->nativeRemaining = nativeRemaining;
+    diagnostic->reason = "first-light-inactive";
+    if (engineStatus == 1) return NO;
+    diagnostic->reason = "unsupported-current-status";
+    LampState state = LampForNativeStatus(engineStatus, 0);
+    if (state == LampUnknown) return NO;
+    diagnostic->reason = "invalid-native-remaining";
+    if (nativeRemaining < 0 || nativeRemaining > 999) return NO;
+
+    uintptr_t phaseBegin = 0, phaseEnd = 0;
+    memcpy(&phaseBegin, (const void *)(container + 0x10), sizeof(phaseBegin));
+    memcpy(&phaseEnd, (const void *)(container + 0x18), sizeof(phaseEnd));
+    diagnostic->reason = "invalid-or-empty-phases";
+    if (!PlausibleNativeRange(phaseBegin, phaseEnd, kMaxCarPhases * 24, 8) ||
+        phaseEnd - phaseBegin < 24 || (phaseEnd - phaseBegin) % 24 != 0)
+        return NO;
+
+    size_t phaseCount = (size_t)(phaseEnd - phaseBegin) / 24;
+    diagnostic->phaseCount = (unsigned)phaseCount;
+    diagnostic->reason = "no-current-phase";
+    for (size_t phaseIndex = 0; phaseIndex < phaseCount; phaseIndex++) {
+        const unsigned char *phase =
+            (const unsigned char *)(phaseBegin + phaseIndex * 24);
+        int32_t phaseCode = 0;
+        int64_t startsAt = 0, endsAt = 0;
+        memcpy(&phaseCode, phase, sizeof(phaseCode));
+        memcpy(&startsAt, phase + 8, sizeof(startsAt));
+        memcpy(&endsAt, phase + 16, sizeof(endsAt));
+        if (startsAt <= 0 || endsAt <= startsAt ||
+            endsAt - startsAt > 999 || wallNow < (double)startsAt ||
+            wallNow >= (double)endsAt)
+            continue;
+
+        diagnostic->phaseCode = phaseCode;
+        diagnostic->phaseRemaining = (double)endsAt - wallNow;
+        diagnostic->oldGateMismatch = nextStatus >= 2 && nextStatus <= 8 &&
+            !PhaseCodeMatchesNative(phaseCode, nextStatus);
+        diagnostic->reason = "current-status-phase-mismatch";
+        if (!PhaseCodeMatchesNative(phaseCode, engineStatus)) continue;
+        diagnostic->reason = "phase-cache-rejected";
+        if (!PublishCarPhaseRange(phaseBegin, phaseEnd, monotonicNow, signalId,
+                                  yellowSeconds)) return NO;
+        // Capture only. The HUD thread rechecks the current physical signal
+        // before publishing; a record callback must not override that selection.
+        atomic_store_explicit(&gCarUpdatedAt, monotonicNow, memory_order_release);
+        diagnostic->reason = "ready";
+        return YES;
+    }
+    return NO;
+}
+
+static void LogCarCapture(const CarCaptureDiagnostic *diagnostic,
+                          uint64_t signalId, double monotonicNow) {
+    const char *previousReason = atomic_exchange_explicit(
+        &gCarCaptureReason, diagnostic->reason, memory_order_acq_rel);
+    uint64_t previousId = atomic_exchange_explicit(
+        &gCarCaptureSignalId, signalId, memory_order_relaxed);
+    int previousStatus = atomic_exchange_explicit(
+        &gCarCaptureCurrentStatus, diagnostic->currentStatus, memory_order_relaxed);
+    atomic_store_explicit(&gCarCaptureAt, monotonicNow, memory_order_release);
+    static _Atomic double lastLogged;
+    if (previousReason != diagnostic->reason || previousId != signalId ||
+        previousStatus != diagnostic->currentStatus ||
+        monotonicNow - atomic_load_explicit(&lastLogged, memory_order_relaxed) >= 10.0) {
+        atomic_store_explicit(&lastLogged, monotonicNow, memory_order_relaxed);
+        LogLine("car capture reason=%s id=%llu flag=%d current=%d next=%d nativeRemain=%lld phaseCode=%d phaseRemain=%.1f phases=%u oldGateMismatch=%d",
+                diagnostic->reason, (unsigned long long)signalId,
+                diagnostic->recordFlag, diagnostic->currentStatus,
+                diagnostic->nextStatus, (long long)diagnostic->nativeRemaining,
+                diagnostic->phaseCode, diagnostic->phaseRemaining,
+                diagnostic->phaseCount, diagnostic->oldGateMismatch ? 1 : 0);
+    }
+}
+
 static int HookActiveTrafficRecords(void *records) {
     int result = gOriginalActiveTrafficRecords
         ? gOriginalActiveTrafficRecords(records) : 0;
-
-    if (!PlausibleNativePointer((uintptr_t)records, 8)) return result;
+    double monotonicNow = MonotonicSeconds();
+    CarCaptureDiagnostic diagnostic = {
+        .reason = "invalid-records-object",
+        .recordFlag = -1,
+        .currentStatus = -1,
+        .nextStatus = -1,
+        .nativeRemaining = -1,
+        .phaseCode = -1,
+        .phaseRemaining = -1.0,
+    };
+    if (!PlausibleNativePointer((uintptr_t)records, 8)) {
+        LogCarCapture(&diagnostic, 0, monotonicNow);
+        return result;
+    }
     uintptr_t begin = 0, end = 0;
     memcpy(&begin, (const unsigned char *)records + 8, sizeof(begin));
     memcpy(&end, (const unsigned char *)records + 16, sizeof(end));
     if (!PlausibleNativeRange(begin, end, 216 * 64, 8) ||
-        (end - begin) % 216 != 0)
+        (end - begin) % 216 != 0) {
+        diagnostic.reason = begin == end ? "records-empty" : "invalid-record-vector";
+        LogCarCapture(&diagnostic, 0, monotonicNow);
         return result;
+    }
 
     double wallNow = WallSeconds();
-    double monotonicNow = MonotonicSeconds();
     int nativeStatus = atomic_load_explicit(
         &gNativeStatus, memory_order_acquire);
     size_t count = (size_t)(end - begin) / 216;
+
+    uint64_t processorSyncId = 0;
+    memcpy(&processorSyncId, (const unsigned char *)records + 0x20,
+           sizeof(processorSyncId));
+    if (processorSyncId == UINT64_MAX) processorSyncId = 0;
+    ActiveSignalSnapshot active = {0};
+    BOOL freshTravelSignal = LoadActiveSignalSnapshot(&active) &&
+        active.candidateCount == 1 && active.signalId != 0 &&
+        wallNow - active.updatedAt >= 0.0 &&
+        wallNow - active.updatedAt <= 2.5;
+    uint64_t desiredSignalId = freshTravelSignal ? active.signalId : 0;
+    const char *targetReason = freshTravelSignal ? "travel-current-id" : "no-current-id";
+    if (!freshTravelSignal)
+        LoadCurrentCarTarget(&desiredSignalId, &targetReason, NULL);
+    const unsigned char *exactRecord = NULL;
+    size_t activeCount = 0, exactCount = 0;
+    for (size_t index = 0; index < count; ++index) {
+        const unsigned char *record =
+            (const unsigned char *)(begin + index * 216);
+        int32_t activeFlag = 0;
+        uint64_t recordSignalId = 0;
+        memcpy(&activeFlag, record + 0x54, sizeof(activeFlag));
+        memcpy(&recordSignalId, record + 0x60, sizeof(recordSignalId));
+        if (activeFlag == 1 && recordSignalId) activeCount++;
+        if (desiredSignalId && recordSignalId == desiredSignalId) {
+            exactCount++;
+            exactRecord = record;
+        }
+    }
+
+    // flag==1 may be the following intersection while the current one is 2/6.
+    // Neither that flag nor an old processor sync ID proves current identity.
+    const unsigned char *selectedRecord = exactCount == 1 ? exactRecord : NULL;
+    uint64_t selectedSignalId = selectedRecord ? desiredSignalId : 0;
+    int selectionReason = selectedRecord ? (freshTravelSignal ? 1 : 4) : 0;
+
     static _Atomic double lastLogged;
     if (monotonicNow - atomic_load_explicit(
             &lastLogged, memory_order_relaxed) > 10.0) {
         atomic_store_explicit(&lastLogged, monotonicNow, memory_order_relaxed);
-        LogLine("active traffic records count=%zu status=%d", count,
-                nativeStatus);
+        LogLine("active traffic records count=%zu active=%zu exact=%zu status=%d selectedId=%llu selection=%d travelId=%llu syncId=%llu targetId=%llu targetReason=%s",
+                count, activeCount, exactCount, nativeStatus,
+                (unsigned long long)selectedSignalId, selectionReason,
+                (unsigned long long)(freshTravelSignal ? active.signalId : 0),
+                (unsigned long long)processorSyncId,
+                (unsigned long long)desiredSignalId, targetReason);
     }
-    int64_t phaseEnd = 0;
-    BOOL published = NO;
-    for (size_t index = 0; index < count && !published; index++) {
-        const unsigned char *record = (const unsigned char *)(begin + index * 216);
-        published = PublishCurrentCarTimetable(
-            record, wallNow, monotonicNow, nativeStatus, &phaseEnd);
-    }
+    diagnostic.reason = count == 0 ? "records-empty" : "no-unique-selected-record";
+    if (selectedRecord)
+        PublishCurrentCarTimetable(selectedRecord, wallNow, monotonicNow,
+                                   selectedSignalId, &diagnostic);
+    LogCarCapture(&diagnostic, selectedSignalId, monotonicNow);
 
     return result;
 }
@@ -582,6 +1099,153 @@ static size_t PublishCyclingPhaseRange(uint64_t begin, uint64_t end) {
         ((header + 0x100ULL) & ~(kCyclingTableBusy | 0xffULL)) | kept,
         memory_order_release);
     return kept;
+}
+
+static void InvalidateTravelAdviceSnapshot(void) {
+    if (atomic_flag_test_and_set_explicit(
+            &gTravelAdviceSnapshotWriteLock, memory_order_acquire))
+        return;
+    uint64_t header = atomic_load_explicit(
+        &gTravelAdviceSnapshot[0], memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[0],
+                          header | kTravelAdviceSnapshotBusy,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[1], 0,
+                          memory_order_relaxed);
+    atomic_store_explicit(
+        &gTravelAdviceSnapshot[0],
+        (header + 0x100ULL) & ~(kTravelAdviceSnapshotBusy | 0xffULL),
+        memory_order_release);
+    atomic_flag_clear_explicit(&gTravelAdviceSnapshotWriteLock,
+                               memory_order_release);
+}
+
+static BOOL PublishTravelAdviceSnapshot(void *phases,
+                                        uint32_t distanceMeters,
+                                        int64_t currentTimeSeconds,
+                                        int32_t averageSpeedKmh,
+                                        int32_t maximumWindows,
+                                        int32_t nativeRecommendedSpeedKmh) {
+    if (!PlausibleNativePointer((uintptr_t)phases, 8)) {
+        InvalidateTravelAdviceSnapshot();
+        return NO;
+    }
+    uint64_t begin = 0, end = 0;
+    memcpy(&begin, phases, sizeof(begin));
+    memcpy(&end, (const char *)phases + 8, sizeof(end));
+    if (!PlausibleNativeRange(begin, end, kMaxCyclingPhases * 24, 8) ||
+        end <= begin || (end - begin) % 24 != 0 ||
+        distanceMeters > 10000 || averageSpeedKmh < 0 ||
+        averageSpeedKmh > 100) {
+        InvalidateTravelAdviceSnapshot();
+        return NO;
+    }
+
+    size_t count = (size_t)(end - begin) / 24;
+    uint64_t rows[kMaxCyclingPhases * 3];
+    size_t kept = 0;
+    for (size_t index = 0; index < count; ++index) {
+        const unsigned char *record =
+            (const unsigned char *)(begin + index * 24);
+        int32_t code = 0;
+        int64_t startsAt = 0, endsAt = 0;
+        memcpy(&code, record, sizeof(code));
+        memcpy(&startsAt, record + 8, sizeof(startsAt));
+        memcpy(&endsAt, record + 16, sizeof(endsAt));
+        if (startsAt <= 0 || endsAt <= startsAt ||
+            endsAt - startsAt > 180)
+            continue;
+        rows[kept * 3] = (uint32_t)code;
+        rows[kept * 3 + 1] = (uint64_t)startsAt;
+        rows[kept * 3 + 2] = (uint64_t)endsAt;
+        kept++;
+    }
+    if (!kept) {
+        InvalidateTravelAdviceSnapshot();
+        return NO;
+    }
+    if (atomic_flag_test_and_set_explicit(
+            &gTravelAdviceSnapshotWriteLock, memory_order_acquire))
+        return NO;
+
+    ActiveSignalSnapshot active = {0};
+    LoadActiveSignalSnapshot(&active);
+    uint64_t header = atomic_load_explicit(
+        &gTravelAdviceSnapshot[0], memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[0],
+                          header | kTravelAdviceSnapshotBusy,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[1],
+                          DoubleToBits(WallSeconds()), memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[2], active.signalId,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[3], distanceMeters,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[4],
+                          (uint64_t)(int64_t)averageSpeedKmh,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[5],
+                          (uint64_t)(int64_t)nativeRecommendedSpeedKmh,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[6],
+                          (uint64_t)(int64_t)maximumWindows,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelAdviceSnapshot[7],
+                          (uint64_t)currentTimeSeconds,
+                          memory_order_relaxed);
+    for (size_t index = 0; index < kept * 3; ++index)
+        atomic_store_explicit(
+            &gTravelAdviceSnapshot[kTravelAdviceSnapshotRows + index],
+            rows[index], memory_order_relaxed);
+    atomic_store_explicit(
+        &gTravelAdviceSnapshot[0],
+        ((header + 0x100ULL) &
+         ~(kTravelAdviceSnapshotBusy | 0xffULL)) | kept,
+        memory_order_release);
+    atomic_flag_clear_explicit(&gTravelAdviceSnapshotWriteLock,
+                               memory_order_release);
+    return YES;
+}
+
+static BOOL LoadTravelAdviceSnapshot(TravelAdviceSnapshot *snapshot) {
+    if (!snapshot) return NO;
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        uint64_t before = atomic_load_explicit(
+            &gTravelAdviceSnapshot[0], memory_order_acquire);
+        uint32_t count = (uint32_t)(before & 0xffULL);
+        if ((before & kTravelAdviceSnapshotBusy) || !count ||
+            count > kMaxCyclingPhases)
+            continue;
+        TravelAdviceSnapshot value = {
+            .capturedAt = BitsToDouble(atomic_load_explicit(
+                &gTravelAdviceSnapshot[1], memory_order_relaxed)),
+            .signalId = atomic_load_explicit(
+                &gTravelAdviceSnapshot[2], memory_order_relaxed),
+            .distanceMeters = (int)(int64_t)atomic_load_explicit(
+                &gTravelAdviceSnapshot[3], memory_order_relaxed),
+            .averageSpeedKmh = (int)(int64_t)atomic_load_explicit(
+                &gTravelAdviceSnapshot[4], memory_order_relaxed),
+            .nativeRecommendedSpeedKmh =
+                (int)(int64_t)atomic_load_explicit(
+                    &gTravelAdviceSnapshot[5], memory_order_relaxed),
+            .maximumWindows = (int)(int64_t)atomic_load_explicit(
+                &gTravelAdviceSnapshot[6], memory_order_relaxed),
+            .currentTimeSeconds = (int64_t)atomic_load_explicit(
+                &gTravelAdviceSnapshot[7], memory_order_relaxed),
+            .phaseCount = count,
+        };
+        for (size_t index = 0; index < count * 3; ++index)
+            value.phaseRows[index] = atomic_load_explicit(
+                &gTravelAdviceSnapshot[kTravelAdviceSnapshotRows + index],
+                memory_order_relaxed);
+        uint64_t after = atomic_load_explicit(
+            &gTravelAdviceSnapshot[0], memory_order_acquire);
+        if (before == after && !(after & kTravelAdviceSnapshotBusy)) {
+            *snapshot = value;
+            return YES;
+        }
+    }
+    return NO;
 }
 
 static void ClearCyclingPhaseTable(void) {
@@ -644,63 +1308,85 @@ static void ObserveCyclingTimetable(void *phases) {
         LogLine("cycling probe kept=0 rejected");
 }
 
-static void *HookCyclingTimetableEvaluate(void *context, void *phases,
-                                          uint64_t currentTime, void *outA,
-                                          void *outB, int32_t mode) {
-    void *result = gOriginalCyclingTimetableEvaluate
-        ? gOriginalCyclingTimetableEvaluate(context, phases, currentTime,
-                                            outA, outB, mode) : 0;
+// Every active travel location update refreshes the native route-state speed.
+// Read only NaviService's active route object after AMap finishes the update;
+// never inspect the PosLocInfo4Travel GPS/coordinate input argument.
+static int64_t HookTravelLocationUpdate(void *service,
+                                        const void *locationInfo,
+                                        int32_t pointType) {
+    int64_t result = gOriginalTravelLocationUpdate
+        ? gOriginalTravelLocationUpdate(service, locationInfo, pointType) : 0;
+    if (!gTravelRouteForType ||
+        !PlausibleNativePointer((uintptr_t)service, 8))
+        return result;
+
+    uintptr_t routes = 0;
+    memcpy(&routes, (const char *)service + 0x170, sizeof(routes));
+    if (!PlausibleNativePointer(routes, 8)) return result;
+    uintptr_t route = gTravelRouteForType((void *)routes, 1);
+    if (!PlausibleNativePointer(route, 4)) return result;
+
+    int32_t speedKmh = -1;
+    memcpy(&speedKmh, (const void *)(route + 0x60), sizeof(speedKmh));
+    if (speedKmh < 0 || speedKmh > 100) return result;
+    atomic_store_explicit(&gTravelCurrentSpeedKmh, speedKmh,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelNaviInfoUpdatedAt, WallSeconds(),
+                          memory_order_relaxed);
+    atomic_fetch_add_explicit(&gTravelNaviInfoGeneration, 1,
+                              memory_order_release);
+    return result;
+}
+
+// Active TravelNaviInfo serializer. Its populated native message carries the
+// current cycling speed in km/h plus travel-mode and navigation-state fields.
+static int64_t HookTravelNaviInfoSerialize(const uint8_t *info, void *writer) {
+    int64_t result = gOriginalTravelNaviInfoSerialize
+        ? gOriginalTravelNaviInfoSerialize(info, writer) : 0;
+    int32_t speedKmh = -1, travelMode = -1, navigationStatus = -1;
+    if (PlausibleNativePointer((uintptr_t)info, 4)) {
+        memcpy(&speedKmh, info + 0x68, sizeof(speedKmh));
+        memcpy(&travelMode, info + 0x6c, sizeof(travelMode));
+        memcpy(&navigationStatus, info + 0x70, sizeof(navigationStatus));
+    }
+    atomic_store_explicit(&gTravelCurrentSpeedKmh,
+                          speedKmh >= 0 && speedKmh <= 100 ? speedKmh : -1,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelMode, travelMode, memory_order_relaxed);
+    atomic_store_explicit(&gTravelNavigationStatus, navigationStatus,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelNaviInfoUpdatedAt, WallSeconds(),
+                          memory_order_relaxed);
+    atomic_fetch_add_explicit(&gTravelNaviInfoGeneration, 1,
+                              memory_order_release);
+    return result;
+}
+
+// Active dice::travel::DynamicFixedProvider::calcRecSpeed call. AMap passes a
+// synchronized native signal distance, five-sample average cycling speed in
+// km/h, absolute phase time, and the complete future light-state vector.
+static int32_t HookTravelRecommendSpeed(void *provider, void *phases,
+                                          uint32_t distanceMeters,
+                                            int64_t currentTimeSeconds,
+                                          int32_t averageSpeedKmh,
+                                        int32_t maximumWindows) {
+    int32_t result = gOriginalTravelRecommendSpeed
+        ? gOriginalTravelRecommendSpeed(provider, phases, distanceMeters,
+                                        currentTimeSeconds, averageSpeedKmh,
+                                        maximumWindows) : 0;
     ObserveCyclingTimetable(phases);
-    return result;
-}
-
-// Travel/bike signal status serializer (unslid 0x788474): serializes the
-// model {status @0x8, remainTime @0x10, mainAction @0x18, showType @0x1c}
-// that feeds the bike route bubble. Same reliable production pattern as the
-// car signal serializer.
-static void *HookTravelStatusSerialize(void *model, void *serializer) {
-    void *result = gOriginalTravelStatusSerialize
-        ? gOriginalTravelStatusSerialize(model, serializer) : 0;
-    static _Atomic double lastLogged;
-    double now = WallSeconds();
-    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 5.0) {
-        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
-        int32_t status = -1, mainAction = -1, showType = -1;
-        int64_t remainTime = -1;
-        if (PlausibleNativePointer((uintptr_t)model, 4)) {
-            memcpy(&status, (const char *)model + 0x08, sizeof(status));
-            memcpy(&remainTime, (const char *)model + 0x10, sizeof(remainTime));
-            memcpy(&mainAction, (const char *)model + 0x18, sizeof(mainAction));
-            memcpy(&showType, (const char *)model + 0x1c, sizeof(showType));
-        }
-        LogLine("travel status st=%d remain=%lld action=%d show=%d",
-                status, (long long)remainTime, mainAction, showType);
-    }
-    return result;
-}
-
-// Array variant (unslid 0x788568): fires whenever the travel signal list
-// serializes, even when empty; distinguishes a dormant path from an empty
-// list.
-static void *HookTravelStatusArray(void *writer, void *unused, void *vector) {
-    void *result = gOriginalTravelStatusArray
-        ? gOriginalTravelStatusArray(writer, unused, vector) : 0;
-    static _Atomic double lastLogged;
-    double now = WallSeconds();
-    if (now - atomic_load_explicit(&lastLogged, memory_order_relaxed) > 10.0) {
-        atomic_store_explicit(&lastLogged, now, memory_order_relaxed);
-        uint64_t begin = 0, end = 0;
-        size_t count = 0;
-        if (PlausibleNativePointer((uintptr_t)vector, 8)) {
-            memcpy(&begin, vector, sizeof(begin));
-            memcpy(&end, (const char *)vector + 8, sizeof(end));
-            if (PlausibleNativeRange(begin, end, 32 * 1024, 8) && end >= begin)
-                count = (size_t)((end - begin) >> 5);
-            else
-                count = (size_t)-1;
-        }
-        LogLine("travel array count=%zu", count);
-    }
+    PublishTravelAdviceSnapshot(phases, distanceMeters, currentTimeSeconds,
+                                averageSpeedKmh, maximumWindows, result);
+    atomic_store_explicit(&gTravelAdviceDistanceMeters,
+                          distanceMeters <= 10000 ? (int)distanceMeters : -1,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelAverageSpeedKmh,
+                          averageSpeedKmh >= 0 && averageSpeedKmh <= 100
+                              ? averageSpeedKmh : -1,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gTravelNativeRecommendedSpeedKmh,
+                          result >= 0 && result <= 100 ? result : -1,
+                          memory_order_relaxed);
     return result;
 }
 
@@ -709,100 +1395,6 @@ static int ReadKnownInt32(const void *base, size_t offset) {
     int32_t value = -1;
     memcpy(&value, (const char *)base + offset, sizeof(value));
     return value;
-}
-
-// Native route-guide builder for the @lightdistance@ placeholder. This is a
-// normal virtual method with a standard ABI; AMap computes and writes +0x474.
-static uintptr_t HookGuideLightDistanceBuild(void *formatter, void *route,
-                                              uintptr_t index) {
-    int before = ReadKnownInt32(formatter, 0x474);
-    uintptr_t result = gOriginalGuideLightDistanceBuild
-        ? gOriginalGuideLightDistanceBuild(formatter, route, index) : 0;
-    int after = ReadKnownInt32(formatter, 0x474);
-    int routeBase = ReadKnownInt32(route, 0x180);
-    int routeMode = ReadKnownInt32(route, 0x370);
-    atomic_store_explicit(&gGuideLightDistanceBefore, before,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gGuideLightDistanceMeters, after,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gGuideLightRouteBase, routeBase,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gGuideLightRouteMode, routeMode,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gGuideLightRouteIndex, index,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gGuideLightUpdatedAt, WallSeconds(),
-                          memory_order_relaxed);
-    atomic_fetch_add_explicit(&gGuideLightBuildGeneration, 1,
-                              memory_order_release);
-    return result;
-}
-
-static void CaptureGuideLightFormat(void *formatter) {
-    atomic_store_explicit(&gGuideLightDistanceMeters,
-                          ReadKnownInt32(formatter, 0x474),
-                          memory_order_relaxed);
-    atomic_store_explicit(&gGuideLightUpdatedAt, WallSeconds(),
-                          memory_order_relaxed);
-    atomic_fetch_add_explicit(&gGuideLightFormatGeneration, 1,
-                              memory_order_release);
-}
-
-static uintptr_t HookGuideLightDistanceFormatA(void *formatter) {
-    CaptureGuideLightFormat(formatter);
-    return gOriginalGuideLightDistanceFormatA
-        ? gOriginalGuideLightDistanceFormatA(formatter) : 0;
-}
-
-static uintptr_t HookGuideLightDistanceFormatB(void *formatter) {
-    CaptureGuideLightFormat(formatter);
-    return gOriginalGuideLightDistanceFormatB
-        ? gOriginalGuideLightDistanceFormatB(formatter) : 0;
-}
-
-static uintptr_t HookFirstLightStatsSerialize(uint32_t *stats,
-                                               void *serializer) {
-    if (PlausibleNativePointer((uintptr_t)stats, 4)) {
-        uint32_t values[3] = {0};
-        memcpy(values, stats, sizeof(values));
-        atomic_store_explicit(&gFirstLightTotalCount, (int)values[0],
-                              memory_order_relaxed);
-        atomic_store_explicit(&gFirstLightDistanceMeters, (int)values[1],
-                              memory_order_relaxed);
-        atomic_store_explicit(&gFirstLightTimeSeconds, (int)values[2],
-                              memory_order_relaxed);
-        atomic_fetch_add_explicit(&gFirstLightStatsGeneration, 1,
-                                  memory_order_release);
-    }
-    return gOriginalFirstLightStatsSerialize
-        ? gOriginalFirstLightStatsSerialize(stats, serializer) : 0;
-}
-
-static void CaptureRouteSummary(void *summary) {
-    if (!PlausibleNativePointer((uintptr_t)summary, 4)) return;
-    atomic_store_explicit(&gRouteSummaryEtaDistance,
-                          ReadKnownInt32(summary, 0xdc),
-                          memory_order_relaxed);
-    atomic_store_explicit(&gRouteSummaryEtaTime,
-                          ReadKnownInt32(summary, 0xe0),
-                          memory_order_relaxed);
-    atomic_store_explicit(&gRouteSummaryRemainingLights,
-                          ReadKnownInt32(summary, 0xe8),
-                          memory_order_relaxed);
-    atomic_fetch_add_explicit(&gRouteSummaryGeneration, 1,
-                              memory_order_release);
-}
-
-static uintptr_t HookRouteSummarySerializeA(void *summary, void *serializer) {
-    CaptureRouteSummary(summary);
-    return gOriginalRouteSummarySerializeA
-        ? gOriginalRouteSummarySerializeA(summary, serializer) : 0;
-}
-
-static uintptr_t HookRouteSummarySerializeB(void *summary, void *serializer) {
-    CaptureRouteSummary(summary);
-    return gOriginalRouteSummarySerializeB
-        ? gOriginalRouteSummarySerializeB(summary, serializer) : 0;
 }
 
 // Active travel-signal selector. AMap compares navigationState+0x0c against
@@ -831,19 +1423,28 @@ static uintptr_t HookActiveTravelSignalRoute(void *processor, void *signals,
                 int itemOffset = ReadKnownInt32((void *)item, 0x44);
                 int itemRangeEnd = ReadKnownInt32((void *)item, 0x48);
                 if (itemOffset < 0 || itemRangeEnd < itemOffset) continue;
-                candidateCount++;
                 if (currentOffset <= itemRangeEnd &&
                     currentOffset > itemOffset) {
-                    memcpy(&signalId, (const void *)(item + 8),
-                           sizeof(signalId));
-                    targetOffset = itemOffset;
-                    rangeEnd = itemRangeEnd;
-                    distance = currentOffset - itemOffset;
-                    break;
+                    candidateCount++;
+                    if (candidateCount == 1) {
+                        memcpy(&signalId, (const void *)(item + 8),
+                               sizeof(signalId));
+                        targetOffset = itemOffset;
+                        rangeEnd = itemRangeEnd;
+                        distance = currentOffset - itemOffset;
+                    }
                 }
             }
         }
     }
+    if (candidateCount != 1) {
+        signalId = 0;
+        targetOffset = -1;
+        rangeEnd = -1;
+        distance = -1;
+    }
+    atomic_fetch_add_explicit(&gActiveSignalRouteGeneration, 1,
+                              memory_order_relaxed);
     atomic_store_explicit(&gActiveSignalRouteCandidateCount, candidateCount,
                           memory_order_relaxed);
     atomic_store_explicit(&gActiveSignalRouteDistance, distance,
@@ -861,148 +1462,6 @@ static uintptr_t HookActiveTravelSignalRoute(void *processor, void *signals,
     atomic_fetch_add_explicit(&gActiveSignalRouteGeneration, 1,
                               memory_order_release);
     return result;
-}
-
-static int ReadKnownDistanceObject(void *pair, uintptr_t *objectOut) {
-    if (objectOut) *objectOut = 0;
-    if (!PlausibleNativePointer((uintptr_t)pair, 8)) return -1;
-    uintptr_t object = 0;
-    memcpy(&object, pair, sizeof(object));
-    if (!PlausibleNativePointer(object, 4)) return -1;
-    int32_t value = -1;
-    memcpy(&value, (const void *)(object + 0x1c), sizeof(value));
-    if (value < -1000 || value > 1000000) return -1;
-    if (objectOut) *objectOut = object;
-    return value;
-}
-
-// Standard-ABI envelope around the custom-register distancetolight formatter.
-// Its third argument is the native current-object pair consumed by the inner
-// function; +0x1c is passed directly as the distancetolight value.
-static uintptr_t HookRouteDistanceEnvelope(void *context, void *previous,
-                                            void *current, void *extra) {
-    uintptr_t result = gOriginalRouteDistanceEnvelope
-        ? gOriginalRouteDistanceEnvelope(context, previous, current, extra)
-        : 0;
-    uintptr_t object = 0;
-    int distance = ReadKnownDistanceObject(current, &object);
-    atomic_store_explicit(&gRouteDistanceEnvelopeMeters, distance,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gRouteDistanceEnvelopeObject, object,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gRouteDistanceUpdatedAt, WallSeconds(),
-                          memory_order_relaxed);
-    atomic_fetch_add_explicit(&gRouteDistanceGeneration, 1,
-                              memory_order_release);
-    return result;
-}
-
-// A second standard-ABI producer builds current/next object pairs at +0xc0 and
-// +0xd0 before invoking its custom-register distance formatter.
-static uintptr_t HookRouteDistanceContext(void *context) {
-    uintptr_t result = gOriginalRouteDistanceContext
-        ? gOriginalRouteDistanceContext(context) : 0;
-    uintptr_t firstObject = 0, secondObject = 0;
-    int first = -1, second = -1;
-    if (PlausibleNativePointer((uintptr_t)context, 8)) {
-        first = ReadKnownDistanceObject((char *)context + 0xc0,
-                                        &firstObject);
-        second = ReadKnownDistanceObject((char *)context + 0xd0,
-                                         &secondObject);
-    }
-    int distance = first >= 0 ? first : second;
-    uintptr_t object = first >= 0 ? firstObject : secondObject;
-    atomic_store_explicit(&gRouteDistanceContextMeters, distance,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gRouteDistanceContextObject, object,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gRouteDistanceUpdatedAt, WallSeconds(),
-                          memory_order_relaxed);
-    atomic_fetch_add_explicit(&gRouteDistanceGeneration, 1,
-                              memory_order_release);
-    return result;
-}
-
-// Native multiple-traffic-light selector (unslid 0x11FE7D4). AMap itself
-// computes currentRouteOffset - trafficLightRouteOffset and compares the result
-// with trafficlight_display_distance (default 500 m). Observe the same primitive
-// route fields at this standard-ABI boundary; do not read GPS or coordinates.
-static void *HookTrafficSignalRenderUpdate(void *controller, void *trafficData,
-                                            void *navigationState) {
-    int bestDistance = -1;
-    int currentOffset = 0;
-    int targetOffset = 0;
-    uint64_t selectedLinkId = 0;
-    uint32_t currentLink = 0;
-    unsigned candidateCount = 0;
-
-    if (PlausibleNativePointer((uintptr_t)controller, 4) &&
-        PlausibleNativePointer((uintptr_t)trafficData, 8) &&
-        PlausibleNativePointer((uintptr_t)navigationState, 4)) {
-        uint64_t begin = 0, end = 0;
-        int32_t displayLimit = 0;
-        memcpy(&begin, (const char *)trafficData + 0x128, sizeof(begin));
-        memcpy(&end, (const char *)trafficData + 0x130, sizeof(end));
-        memcpy(&displayLimit, (const char *)controller + 0x54,
-               sizeof(displayLimit));
-        memcpy(&currentOffset, (const char *)navigationState + 0x0c,
-               sizeof(currentOffset));
-        memcpy(&currentLink, (const char *)navigationState + 0x28,
-               sizeof(currentLink));
-
-        if (displayLimit > 0 && displayLimit <= 5000 &&
-            PlausibleNativeRange(begin, end, 128 * 0xe8, 8) && end >= begin &&
-            (end - begin) % 0xe8 == 0) {
-            unsigned count = (unsigned)((end - begin) / 0xe8);
-            for (unsigned index = 0; index < count; ++index) {
-                uintptr_t item = (uintptr_t)begin + index * 0xe8;
-                int32_t active = 0, signalOffset = 0;
-                uint32_t signalLink = 0;
-                uint64_t linkId = 0;
-                memcpy(&active, (const void *)(item + 0x08), sizeof(active));
-                memcpy(&signalOffset, (const void *)(item + 0x4c),
-                       sizeof(signalOffset));
-                memcpy(&linkId, (const void *)(item + 0x60), sizeof(linkId));
-                memcpy(&signalLink, (const void *)(item + 0x68),
-                       sizeof(signalLink));
-                if (active != 1) continue;
-
-                int distance = currentOffset - signalOffset;
-                BOOL sameLink = signalLink == currentLink;
-                if (!sameLink && (distance < 1 || distance > displayLimit))
-                    continue;
-                candidateCount++;
-                if (bestDistance < 0 ||
-                    (distance >= 0 && distance < bestDistance)) {
-                    bestDistance = distance;
-                    targetOffset = signalOffset;
-                    selectedLinkId = linkId;
-                }
-            }
-        }
-    }
-
-    atomic_store_explicit(&gSignalDistanceCandidateCount, candidateCount,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gSignalDistanceMeters, bestDistance,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gSignalDistanceCurrentOffset, currentOffset,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gSignalDistanceTargetOffset, targetOffset,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gSignalDistanceLinkId, selectedLinkId,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gSignalDistanceCurrentLink, currentLink,
-                          memory_order_relaxed);
-    atomic_store_explicit(&gSignalDistanceUpdatedAt, WallSeconds(),
-                          memory_order_relaxed);
-    atomic_fetch_add_explicit(&gSignalDistanceGeneration, 1,
-                              memory_order_release);
-
-    return gOriginalTrafficSignalRenderUpdate
-        ? gOriginalTrafficSignalRenderUpdate(controller, trafficData,
-                                             navigationState)
-        : 0;
 }
 
 // Processes component.dynamicTravelTrafficSignalInfo into the exact native
@@ -1023,6 +1482,7 @@ static void HookDynamicTrafficSignalUpdate(void *processor, void *data,
 
     unsigned outerCount = (unsigned)((end - begin) / 0x70);
     unsigned innerCount = 0, phaseCount = 0, publishedCount = 0;
+    uint64_t selectedSignalId = 0;
     for (unsigned i = 0; i < 12; ++i)
         atomic_store_explicit(&gTrafficSignalPhaseRows[i], 0,
                               memory_order_relaxed);
@@ -1055,6 +1515,8 @@ static void HookDynamicTrafficSignalUpdate(void *processor, void *data,
                 (unsigned)((phaseEnd - phaseBegin) / 24);
             if (!selected) {
                 selected = YES;
+                memcpy(&selectedSignalId, (const void *)(item + 8),
+                       sizeof(selectedSignalId));
                 phaseCount = localPhaseCount;
                 unsigned captured = localPhaseCount < 4 ? localPhaseCount : 4;
                 for (unsigned phase = 0; phase < captured; ++phase) {
@@ -1084,11 +1546,18 @@ static void HookDynamicTrafficSignalUpdate(void *processor, void *data,
 
     if (!publishedCount) {
         ClearCyclingPhaseTable();
+        selectedSignalId = 0;
         double monotonicNow = MonotonicSeconds();
         if (monotonicNow - atomic_load_explicit(
                 &gCarUpdatedAt, memory_order_acquire) > 2.5)
-            PublishDisplayState(LampUnknown, 0, 0);
+            PublishDisplayState(LampUnknown, 0, 0,
+                                CountdownSourceUnknown);
     }
+    atomic_store_explicit(&gCyclingTableSignalId, selectedSignalId,
+                          memory_order_relaxed);
+    atomic_store_explicit(&gCyclingTableUpdatedAt,
+                          publishedCount ? WallSeconds() : 0.0,
+                          memory_order_relaxed);
 
     atomic_store_explicit(&gTrafficSignalOuterCount, outerCount,
                           memory_order_relaxed);
@@ -1100,6 +1569,284 @@ static void HookDynamicTrafficSignalUpdate(void *processor, void *data,
                           memory_order_relaxed);
     atomic_fetch_add_explicit(&gTrafficSignalGeneration, 1,
                               memory_order_release);
+}
+
+static const char *RawCarStateName(RawCarInputState state) {
+    switch (state) {
+        case RawCarNoInput: return "no-input";
+        case RawCarInvalidInput: return "invalid-input";
+        case RawCarEmpty: return "empty";
+        case RawCarNoUpcoming: return "no-upcoming-signal";
+        case RawCarAmbiguous: return "ambiguous-nearest-signal";
+        case RawCarMissingIdentity: return "missing-signal-id";
+        case RawCarUnsupported: return "nearest-signal-unsupported";
+        case RawCarNoPhases: return "nearest-signal-no-phases";
+        case RawCarInvalidPhases: return "invalid-phases";
+        case RawCarReady: return "ready";
+    }
+    return "invalid-state";
+}
+
+static BOOL StoreRawCarInput(const RawCarInputSnapshot *snapshot) {
+    // Nothing that can call the native engine or log runs while this is held.
+    while (atomic_flag_test_and_set_explicit(&gRawCarInputLock,
+                                             memory_order_acquire)) {}
+    BOOL newer = snapshot->observation > gRawCarInput.observation;
+    if (newer) gRawCarInput = *snapshot;
+    atomic_flag_clear_explicit(&gRawCarInputLock, memory_order_release);
+    return newer;
+}
+
+static BOOL LoadRawCarInput(RawCarInputSnapshot *snapshot) {
+    while (atomic_flag_test_and_set_explicit(&gRawCarInputLock,
+                                             memory_order_acquire)) {}
+    *snapshot = gRawCarInput;
+    atomic_flag_clear_explicit(&gRawCarInputLock, memory_order_release);
+    return snapshot->observation != 0;
+}
+
+static BOOL LoadCurrentCarTarget(uint64_t *signalId, const char **reason,
+                                 RawCarInputSnapshot *snapshotOut) {
+    *signalId = 0;
+    *reason = "no-current-car-input";
+    RawCarInputSnapshot snapshot = {0};
+    if (!LoadRawCarInput(&snapshot)) return NO;
+    *reason = "current-car-input-stale";
+    double age = MonotonicSeconds() - snapshot.capturedAt;
+    if (!isfinite(age) || age < 0.0 || age > 2.5) return NO;
+    *reason = "no-valid-current-car-target";
+    if ((snapshot.state != RawCarReady && snapshot.state != RawCarNoPhases) ||
+        snapshot.eligibleFlag != 1 || snapshot.distanceMeters < 0 ||
+        !snapshot.signalId || snapshot.signalId == UINT64_MAX) return NO;
+    *signalId = snapshot.signalId;
+    if (snapshotOut) *snapshotOut = snapshot;
+    *reason = "raw-current-id";
+    return YES;
+}
+
+static void ObserveRawCarTrafficInput(void *processor, const void *feed,
+                                      const void *navigationState) {
+    uint64_t observation = atomic_fetch_add_explicit(
+        &gRawCarObservationSequence, 1, memory_order_relaxed) + 1;
+    RawCarInputSnapshot snapshot = {
+        .capturedAt = MonotonicSeconds(), .observation = observation,
+        .state = RawCarInvalidInput,
+        .distanceMeters = -1, .displayLimit = -1, .yellowSeconds = -1,
+        .eligibleFlag = -1, .currentOffset = -1, .targetOffset = -1,
+    };
+    do {
+        if (!PlausibleNativePointer((uintptr_t)processor, 8) ||
+            !PlausibleNativePointer((uintptr_t)feed, 8) ||
+            !PlausibleNativePointer((uintptr_t)navigationState, 4)) break;
+        snapshot.currentOffset = ReadKnownInt32(navigationState, 0x0c);
+        snapshot.displayLimit = ReadKnownInt32(processor, 0x54);
+        if (snapshot.currentOffset < 0) break;
+        uintptr_t begin = 0, end = 0;
+        memcpy(&begin, (const unsigned char *)feed + 296, sizeof(begin));
+        memcpy(&end, (const unsigned char *)feed + 304, sizeof(end));
+        if (begin == end) { snapshot.state = RawCarEmpty; break; }
+        if (!PlausibleNativeRange(begin, end, 232 * 512, 8) ||
+            (end - begin) % 232 != 0) break;
+        snapshot.inputCount = (unsigned)((end - begin) / 232);
+        uintptr_t nearest = 0;
+        int64_t nearestDistance = INT64_MAX;
+        unsigned nearestCount = 0;
+        for (unsigned i = 0; i < snapshot.inputCount; ++i) {
+            uintptr_t item = begin + i * 232;
+            int target = ReadKnownInt32((const void *)item, 0x4c);
+            if (target < 0) continue;
+            int64_t distance = (int64_t)snapshot.currentOffset - target;
+            if (distance < 0) continue; // At zero we are at the light, not past it.
+            if (distance < nearestDistance) {
+                nearest = item;
+                nearestDistance = distance;
+                nearestCount = 1;
+            } else if (distance == nearestDistance) {
+                nearestCount++;
+            }
+        }
+        snapshot.state = RawCarNoUpcoming;
+        if (!nearest) break;
+        snapshot.state = RawCarAmbiguous;
+        if (nearestCount != 1) break;
+        snapshot.distanceMeters = (int)nearestDistance;
+        snapshot.targetOffset = ReadKnownInt32((const void *)nearest, 0x4c);
+        memcpy(&snapshot.signalId, (const void *)(nearest + 0x60),
+               sizeof(snapshot.signalId));
+        snapshot.state = RawCarMissingIdentity;
+        if (!snapshot.signalId || snapshot.signalId == UINT64_MAX) break;
+        snapshot.eligibleFlag = ReadKnownInt32((const void *)nearest, 8);
+        snapshot.state = RawCarUnsupported;
+        // Do not skip an unsupported nearest light to show a farther one.
+        if (snapshot.eligibleFlag != 1) break;
+        snapshot.yellowSeconds = ReadKnownInt32((const void *)nearest, 224);
+        uintptr_t phaseBegin = 0, phaseEnd = 0;
+        // The native converter copies the primary light at source+120:
+        // vector<Phase24> is at +16/+24, NOT any of the coordinate fields.
+        memcpy(&phaseBegin, (const void *)(nearest + 136), sizeof(phaseBegin));
+        memcpy(&phaseEnd, (const void *)(nearest + 144), sizeof(phaseEnd));
+        snapshot.state = RawCarNoPhases;
+        if (phaseBegin == phaseEnd) break;
+        snapshot.state = RawCarInvalidPhases;
+        if (!PlausibleNativeRange(phaseBegin, phaseEnd, kMaxCarPhases * 24, 8) ||
+            (phaseEnd - phaseBegin) % 24 != 0) break;
+        unsigned count = (unsigned)((phaseEnd - phaseBegin) / 24);
+        int64_t previousEnd = 0;
+        BOOL valid = YES;
+        for (unsigned i = 0; i < count; ++i) {
+            const unsigned char *phase = (const unsigned char *)(phaseBegin + i * 24);
+            int32_t code = 0;
+            int64_t startsAt = 0, endsAt = 0;
+            memcpy(&code, phase, sizeof(code));
+            memcpy(&startsAt, phase + 8, sizeof(startsAt));
+            memcpy(&endsAt, phase + 16, sizeof(endsAt));
+            if (startsAt <= 0 || endsAt <= startsAt || endsAt - startsAt > 999 ||
+                (i && startsAt < previousEnd)) { valid = NO; break; }
+            snapshot.phases[i * 3] = (uint32_t)code;
+            snapshot.phases[i * 3 + 1] = (uint64_t)startsAt;
+            snapshot.phases[i * 3 + 2] = (uint64_t)endsAt;
+            previousEnd = endsAt;
+        }
+        if (!valid) break;
+        snapshot.phaseCount = count;
+        snapshot.state = count ? RawCarReady : RawCarNoPhases;
+    } while (0);
+    if (!StoreRawCarInput(&snapshot)) return; // A newer callback already won.
+
+    static _Atomic int lastState = -1;
+    static _Atomic uint64_t lastId;
+    static _Atomic double lastLogged;
+    if (atomic_exchange_explicit(&lastState, snapshot.state, memory_order_relaxed) !=
+            (int)snapshot.state ||
+        atomic_load_explicit(&lastId, memory_order_relaxed) != snapshot.signalId ||
+        snapshot.capturedAt - atomic_load_explicit(&lastLogged, memory_order_relaxed) >= 10.0) {
+        atomic_store_explicit(&lastId, snapshot.signalId, memory_order_relaxed);
+        atomic_store_explicit(&lastLogged, snapshot.capturedAt, memory_order_relaxed);
+        LogLine("raw car input reason=%s count=%u id=%llu eligible=%d current=%d target=%d distance=%d displayLimit=%d phases=%u outsideDisplayWindow=%d",
+                RawCarStateName(snapshot.state), snapshot.inputCount,
+                (unsigned long long)snapshot.signalId, snapshot.eligibleFlag,
+                snapshot.currentOffset, snapshot.targetOffset, snapshot.distanceMeters,
+                snapshot.displayLimit, snapshot.phaseCount,
+                snapshot.displayLimit > 0 && snapshot.distanceMeters > snapshot.displayLimit);
+    }
+}
+
+// Standard X0/X1/X2 entry with a full stack prologue. Observe the incoming
+// native vector before local distance/lifecycle filtering. Forward all inputs
+// and the return register unchanged; do not move the user's location.
+static uintptr_t HookCarTrafficInput(void *processor, const void *feed,
+                                     const void *navigationState) {
+    ObserveRawCarTrafficInput(processor, feed, navigationState);
+    return gOriginalCarTrafficInput
+        ? gOriginalCarTrafficInput(processor, feed, navigationState) : 0;
+}
+
+static BOOL CommitIdentifiedCarDisplay(const RawCarInputSnapshot *snapshot,
+                                      LampState state, double phaseEnd,
+                                      unsigned expectedDisplayGeneration,
+                                      CountdownSource source) {
+    BOOL committed = NO;
+    // Lock order is raw -> display. No path holds display while acquiring raw.
+    while (atomic_flag_test_and_set_explicit(&gRawCarInputLock,
+                                             memory_order_acquire)) {}
+    gRawCarRejectReason = "newer-raw-input";
+    if (gRawCarInput.observation == snapshot->observation &&
+        gRawCarInput.signalId == snapshot->signalId &&
+        (gRawCarInput.state == RawCarReady ||
+         (source == CountdownSourceCar && gRawCarInput.state == RawCarNoPhases))) {
+        while (atomic_flag_test_and_set_explicit(&gDisplayWriteLock,
+                                                 memory_order_acquire)) {}
+        unsigned generation = atomic_load_explicit(&gDisplayGeneration,
+                                                    memory_order_relaxed);
+        gRawCarRejectReason = "newer-display-publication";
+        if (!(expectedDisplayGeneration & 1U) &&
+            generation == expectedDisplayGeneration) {
+            atomic_store_explicit(&gDisplayGeneration, generation + 1U,
+                                  memory_order_release);
+            atomic_store_explicit(&gLampState, state, memory_order_relaxed);
+            atomic_store_explicit(&gCountdownSource, source, memory_order_relaxed);
+            atomic_store_explicit(&gPhaseEndMonotonic, phaseEnd, memory_order_relaxed);
+            atomic_store_explicit(&gTimetableUpdatedAt, snapshot->capturedAt,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&gDisplayGeneration, generation + 2U,
+                                  memory_order_release);
+            committed = YES;
+        }
+        atomic_flag_clear_explicit(&gDisplayWriteLock, memory_order_release);
+    }
+    atomic_flag_clear_explicit(&gRawCarInputLock, memory_order_release);
+    return committed;
+}
+
+static BOOL PublishRawCarCountdown(double wallNow, double monotonicNow,
+                                   unsigned expectedDisplayGeneration) {
+    gRawCarRejectReason = "no-input";
+    RawCarInputSnapshot snapshot = {0};
+    if (!LoadRawCarInput(&snapshot)) return NO;
+    gRawCarRejectReason = RawCarStateName(snapshot.state);
+    if (snapshot.state != RawCarReady || !snapshot.signalId ||
+        snapshot.distanceMeters < 0 || !snapshot.phaseCount) return NO;
+    gRawCarRejectReason = "input-age-2.5s";
+    double age = monotonicNow - snapshot.capturedAt;
+    if (!isfinite(age) || age < 0.0 || age > 2.5) return NO;
+    double travelAge = wallNow - atomic_load_explicit(
+        &gTravelNaviInfoUpdatedAt, memory_order_relaxed);
+    if (travelAge >= 0.0 && travelAge <= 2.5) {
+        ActiveSignalSnapshot active = {0};
+        gRawCarRejectReason = "unmatched-travel-signal";
+        if (!LoadActiveSignalSnapshot(&active) || active.candidateCount != 1 ||
+            active.signalId != snapshot.signalId || wallNow - active.updatedAt < 0.0 ||
+            wallNow - active.updatedAt > 2.5) return NO;
+    }
+    gRawCarRejectReason = "no-current-phase";
+    for (unsigned i = 0; i < snapshot.phaseCount; ++i) {
+        int code = (int32_t)(uint32_t)snapshot.phases[i * 3];
+        double start = (double)(int64_t)snapshot.phases[i * 3 + 1];
+        double end = (double)(int64_t)snapshot.phases[i * 3 + 2];
+        if (wallNow < start || wallNow >= end) continue;
+        LampState state = LampForNativeStatus(-1, code);
+        gRawCarRejectReason = "unsupported-current-phase";
+        if (state == LampUnknown) return NO;
+        double remaining = end - wallNow;
+        // Match 0x101200E78..EA4: negative explicitly disables native yellow;
+        // otherwise compare against the full nonnegative threshold (no guessed cap).
+        if (state == LampGreen && snapshot.yellowSeconds >= 0 &&
+            remaining <= snapshot.yellowSeconds)
+            state = LampYellow;
+        // Preserve original input freshness and any intervening native source.
+        if (!CommitIdentifiedCarDisplay(&snapshot, state, monotonicNow + remaining,
+                expectedDisplayGeneration, CountdownSourceCarInput)) return NO;
+        gRawCarRejectReason = "ready";
+        return YES;
+    }
+    return NO;
+}
+
+static void InvalidateUnselectedCarDisplay(void) {
+    BOOL cleared = NO;
+    while (atomic_flag_test_and_set_explicit(&gDisplayWriteLock,
+                                             memory_order_acquire)) {}
+    // All car publishers have failed current-ID/freshness checks this tick.
+    // Clear either car source immediately instead of retaining a passed light;
+    // a valid travel display must remain untouched.
+    if (IsCarCountdownSource(atomic_load_explicit(
+            &gCountdownSource, memory_order_relaxed))) {
+        unsigned generation = atomic_load_explicit(&gDisplayGeneration,
+                                                    memory_order_relaxed);
+        atomic_store_explicit(&gDisplayGeneration, generation + 1U,
+                              memory_order_release);
+        atomic_store_explicit(&gLampState, LampUnknown, memory_order_relaxed);
+        atomic_store_explicit(&gCountdownSource, CountdownSourceUnknown,
+                              memory_order_relaxed);
+        atomic_store_explicit(&gPhaseEndMonotonic, 0.0, memory_order_relaxed);
+        atomic_store_explicit(&gTimetableUpdatedAt, 0.0, memory_order_relaxed);
+        atomic_store_explicit(&gDisplayGeneration, generation + 2U,
+                              memory_order_release);
+        cleared = YES;
+    }
+    atomic_flag_clear_explicit(&gDisplayWriteLock, memory_order_release);
+    if (cleared) LogLine("car countdown invalidated table=%s raw=%s",
+                         gCarTableRejectReason, gRawCarRejectReason);
 }
 
 static void InstallNativeHooks(void) {
@@ -1118,47 +1865,12 @@ static void InstallNativeHooks(void) {
     }
 
     // Version-specific unslid offsets verified against AMapiPhone 16.11.1.
+    gTravelRouteForType = (TravelRouteForTypeFn)(base + 0x00836194ULL);
     hook((void *)(base + 0x00788410ULL), (void *)HookSignalStatusSerialize,
          (void **)&gOriginalSignalStatusSerialize);
-    // Travel/bike signal status model serializer.
-    hook((void *)(base + 0x00788474ULL), (void *)HookTravelStatusSerialize,
-         (void **)&gOriginalTravelStatusSerialize);
-    hook((void *)(base + 0x0078856CULL), (void *)HookTravelStatusArray,
-         (void **)&gOriginalTravelStatusArray);
-    // Native route-guide traffic-light distance and route-summary models.
-    // These are standard-ABI functions; custom-register leaf fragments stay
-    // unhooked.
-    hook((void *)(base + 0x0003367CULL),
-         (void *)HookGuideLightDistanceBuild,
-         (void **)&gOriginalGuideLightDistanceBuild);
-    hook((void *)(base + 0x00033BCCULL),
-         (void *)HookGuideLightDistanceFormatA,
-         (void **)&gOriginalGuideLightDistanceFormatA);
-    hook((void *)(base + 0x00034E54ULL),
-         (void *)HookGuideLightDistanceFormatB,
-         (void **)&gOriginalGuideLightDistanceFormatB);
-    hook((void *)(base + 0x00729DF4ULL),
-         (void *)HookFirstLightStatsSerialize,
-         (void **)&gOriginalFirstLightStatsSerialize);
-    hook((void *)(base + 0x007B626CULL),
-         (void *)HookRouteSummarySerializeA,
-         (void **)&gOriginalRouteSummarySerializeA);
-    hook((void *)(base + 0x007B6B64ULL),
-         (void *)HookRouteSummarySerializeB,
-         (void **)&gOriginalRouteSummarySerializeB);
-    // Standard-ABI envelopes around native distancetolight producers. The
-    // custom-register formatting fragments themselves remain unhooked.
-    hook((void *)(base + 0x0013E2A4ULL),
-         (void *)HookRouteDistanceEnvelope,
-         (void **)&gOriginalRouteDistanceEnvelope);
-    hook((void *)(base + 0x001CF300ULL),
-         (void *)HookRouteDistanceContext,
-         (void **)&gOriginalRouteDistanceContext);
-    // Standard-ABI native route-distance selector for traffic-light render
-    // groups. Diagnostic only; it does not read GPS or alter the HUD.
-    hook((void *)(base + 0x011FE7D4ULL),
-         (void *)HookTrafficSignalRenderUpdate,
-         (void **)&gOriginalTrafficSignalRenderUpdate);
+    hook((void *)(base + 0x00788474ULL),
+         (void *)HookSignalCountdownSerialize,
+         (void **)&gOriginalSignalCountdownSerialize);
     // Active travel-signal selector. The navigation snapshot and 0x70-byte
     // signal items carry current/target native route offsets.
     hook((void *)(base + 0x0120EF04ULL),
@@ -1171,49 +1883,13 @@ static void InstallNativeHooks(void) {
          (void **)&gOriginalDynamicTrafficSignalUpdate);
     {
         uint32_t prologue[4] = {0};
-        memcpy(prologue, (const void *)(base + 0x00788474ULL),
-               sizeof(prologue));
-        LogLine("prologue travel-status %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x0078856CULL),
-               sizeof(prologue));
-        LogLine("prologue travel-array %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x0003367CULL),
-               sizeof(prologue));
-        LogLine("prologue guide-light-build %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x00033BCCULL),
-               sizeof(prologue));
-        LogLine("prologue guide-light-format-a %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x00034E54ULL),
-               sizeof(prologue));
-        LogLine("prologue guide-light-format-b %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x00729DF4ULL),
-               sizeof(prologue));
-        LogLine("prologue first-light-stats %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x007B626CULL),
-               sizeof(prologue));
-        LogLine("prologue route-summary-a %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x007B6B64ULL),
-               sizeof(prologue));
-        LogLine("prologue route-summary-b %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x0013E2A4ULL),
-               sizeof(prologue));
-        LogLine("prologue distance-envelope %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
-        memcpy(prologue, (const void *)(base + 0x001CF300ULL),
-               sizeof(prologue));
-        LogLine("prologue distance-context %08x %08x %08x %08x",
-                prologue[0], prologue[1], prologue[2], prologue[3]);
         memcpy(prologue, (const void *)(base + 0x011FE7D4ULL),
                sizeof(prologue));
-        LogLine("prologue signal-distance %08x %08x %08x %08x",
+        LogLine("prologue car-input %08x %08x %08x %08x",
+                prologue[0], prologue[1], prologue[2], prologue[3]);
+        memcpy(prologue, (const void *)(base + 0x00788474ULL),
+               sizeof(prologue));
+        LogLine("prologue signal-countdown %08x %08x %08x %08x",
                 prologue[0], prologue[1], prologue[2], prologue[3]);
         memcpy(prologue, (const void *)(base + 0x0120EF04ULL),
                sizeof(prologue));
@@ -1223,14 +1899,42 @@ static void InstallNativeHooks(void) {
                sizeof(prologue));
         LogLine("prologue dynamic-signal %08x %08x %08x %08x",
                 prologue[0], prologue[1], prologue[2], prologue[3]);
+        memcpy(prologue, (const void *)(base + 0x0082AF88ULL),
+               sizeof(prologue));
+        LogLine("prologue travel-location-update %08x %08x %08x %08x",
+                prologue[0], prologue[1], prologue[2], prologue[3]);
+        memcpy(prologue, (const void *)(base + 0x00830760ULL),
+               sizeof(prologue));
+        LogLine("prologue travel-navi-info %08x %08x %08x %08x",
+                prologue[0], prologue[1], prologue[2], prologue[3]);
+        memcpy(prologue, (const void *)(base + 0x00840490ULL),
+               sizeof(prologue));
+        LogLine("prologue travel-rec-speed %08x %08x %08x %08x",
+                prologue[0], prologue[1], prologue[2], prologue[3]);
     }
     hook((void *)(base + 0x011FF8C0ULL), (void *)HookActiveTrafficRecords,
          (void **)&gOriginalActiveTrafficRecords);
-    // Bicycle observation goes through the standard-ABI wrapper, never the
-    // fragile 0x840548 leaf (see ObserveCyclingTimetable).
-    hook((void *)(base + 0x00840490ULL), (void *)HookCyclingTimetableEvaluate,
-         (void **)&gOriginalCyclingTimetableEvaluate);
-    LogLine("native countdown hooks installed base=%p", (void *)base);
+    // Read-only native car input, before the overlay's route-distance filter.
+    // Full standard-ABI entry; never hook the custom-register conversion thunk.
+    hook((void *)(base + 0x011FE7D4ULL), (void *)HookCarTrafficInput,
+         (void **)&gOriginalCarTrafficInput);
+    // Active location updates continuously expose route-state speed without
+    // reading the PosLocInfo4Travel input object.
+    hook((void *)(base + 0x0082AF88ULL),
+         (void *)HookTravelLocationUpdate,
+         (void **)&gOriginalTravelLocationUpdate);
+    // Active TravelNaviInfo serializer: current cycling speed, travel mode,
+    // and navigation state in a conventional X0/X1 ABI.
+    hook((void *)(base + 0x00830760ULL),
+         (void *)HookTravelNaviInfoSerialize,
+         (void **)&gOriginalTravelNaviInfoSerialize);
+    // Active travel recommended-speed wrapper. It carries synchronized phase,
+    // distance, and five-sample average speed inputs; the custom-register leaf
+    // at 0x840548 remains unhooked.
+    hook((void *)(base + 0x00840490ULL), (void *)HookTravelRecommendSpeed,
+         (void **)&gOriginalTravelRecommendSpeed);
+    LogLine("native countdown hooks installed base=%p version=%s",
+            (void *)base, DSH_PLUGIN_VERSION);
 }
 
 static id KeyWindow(void) {
@@ -1355,19 +2059,46 @@ static void ApplyOverlayLayout(id window) {
     if (width < 88 || height < 120) return;
 
     if (gFullView) SetRect(gFullView, "setFrame:", bounds);
-    CGFloat lampTop = height > 500 ? 92.0 : 54.0;
-    CGFloat numberTop = lampTop + 70.0;
-    CGFloat numberHeight = height - numberTop - 190.0;
-    if (numberHeight < 160.0) numberHeight = 160.0;
+    BOOL portraitLayout = height > 600.0;
+    BOOL compactLayout = height < 352.0;
+    CGFloat lampTop = portraitLayout ? 92.0 : (compactLayout ? 8.0 : 24.0);
+    CGFloat lampHeight = portraitLayout ? 56.0 : (compactLayout ? 32.0 : 38.0);
+    CGFloat numberTop = lampTop + lampHeight + (portraitLayout ? 14.0 : 4.0);
+    CGFloat disclaimerHeight = compactLayout ? 24.0 : 30.0;
+    CGFloat bottomMargin = compactLayout ? 8.0 : 42.0;
+    CGFloat disclaimerTop = height - bottomMargin - disclaimerHeight;
+    CGFloat actionHeight = portraitLayout ? 40.0 : 32.0;
+    CGFloat detailHeight = portraitLayout ? 44.0 : 30.0;
+    CGFloat detailTop = compactLayout
+        ? disclaimerTop
+        : disclaimerTop - 4.0 - detailHeight;
+    CGFloat actionTop = (compactLayout ? disclaimerTop : detailTop) -
+                        4.0 - actionHeight;
+    CGFloat speedHeight = portraitLayout ? 34.0 : 28.0;
+    CGFloat speedTop = actionTop - 4.0 - speedHeight;
+    CGFloat unitHeight = compactLayout ? 28.0 : 42.0;
+    CGFloat unitTop = speedTop - 4.0 - unitHeight;
+    CGFloat numberHeight = unitTop - numberTop;
+    if (numberHeight < 40.0) numberHeight = 40.0;
+
     SetRect(gFullLampLabel, "setFrame:",
-            (CGRect){{24, lampTop}, {width - 48, 56}});
+            (CGRect){{24, lampTop}, {width - 48, lampHeight}});
     SetRect(gFullSecondsLabel, "setFrame:",
             (CGRect){{20, numberTop}, {width - 40, numberHeight}});
     FitFullscreenNumberFont(width - 40, numberHeight);
     SetRect(gFullUnitLabel, "setFrame:",
-            (CGRect){{20, numberTop + numberHeight}, {width - 40, 42}});
+            (CGRect){{20, unitTop}, {width - 40, unitHeight}});
+    SetRect(gFullSpeedLabel, "setFrame:",
+            (CGRect){{20, speedTop}, {width - 40, speedHeight}});
+    SetRect(gFullAdviceActionLabel, "setFrame:",
+            (CGRect){{20, actionTop}, {width - 40, actionHeight}});
+    SetRect(gFullAdviceDetailLabel, "setFrame:",
+            (CGRect){{20, detailTop}, {width - 40, detailHeight}});
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(
+        gFullAdviceDetailLabel, S("setHidden:"), compactLayout);
     SetRect(gFullDisclaimerLabel, "setFrame:",
-            (CGRect){{20, height - 72}, {width - 40, 30}});
+            (CGRect){{20, disclaimerTop},
+                     {width - 40, disclaimerHeight}});
 
     CGPoint center = ((CGPoint (*)(id, SEL))objc_msgSend)(gBall, S("center"));
     if (!gBallPositioned) {
@@ -1516,6 +2247,9 @@ static void EnsureOverlay(id window) {
             gFullLampLabel = CreateLabel(fullFrame, 36.0, 1);
             gFullSecondsLabel = CreateLabel(fullFrame, 180.0, 1);
             gFullUnitLabel = CreateLabel(fullFrame, 24.0, 1);
+            gFullSpeedLabel = CreateLabel(fullFrame, 22.0, 1);
+            gFullAdviceActionLabel = CreateLabel(fullFrame, 28.0, 1);
+            gFullAdviceDetailLabel = CreateLabel(fullFrame, 15.0, 2);
             gFullDisclaimerLabel = CreateLabel(fullFrame, 15.0, 1);
             if (gFullLampLabel)
                 MsgVoidObj(gFullView, "addSubview:", gFullLampLabel);
@@ -1523,10 +2257,22 @@ static void EnsureOverlay(id window) {
                 MsgVoidObj(gFullView, "addSubview:", gFullSecondsLabel);
             if (gFullUnitLabel)
                 MsgVoidObj(gFullView, "addSubview:", gFullUnitLabel);
+            if (gFullSpeedLabel)
+                MsgVoidObj(gFullView, "addSubview:", gFullSpeedLabel);
+            if (gFullAdviceActionLabel)
+                MsgVoidObj(gFullView, "addSubview:", gFullAdviceActionLabel);
+            if (gFullAdviceDetailLabel)
+                MsgVoidObj(gFullView, "addSubview:", gFullAdviceDetailLabel);
             if (gFullDisclaimerLabel)
                 MsgVoidObj(gFullView, "addSubview:", gFullDisclaimerLabel);
             MsgVoidObj(gFullUnitLabel, "setText:",
                        NSStr("秒 · 距路口 --米"));
+            MsgVoidObj(gFullSpeedLabel, "setText:",
+                       NSStr("当前速度 -- km/h"));
+            MsgVoidObj(gFullAdviceActionLabel, "setText:",
+                       NSStr("等待骑行速度"));
+            MsgVoidObj(gFullAdviceDetailLabel, "setText:",
+                       NSStr("速度和相位有效后自动计算"));
             MsgVoidObj(gFullDisclaimerLabel, "setText:",
                        NSStr("仅供参考，以现场信号灯为准"));
             ((void (*)(id, SEL, BOOL))objc_msgSend)(
@@ -1561,37 +2307,198 @@ static void EnsureOverlay(id window) {
                    gExpanded ? gFullView : gBall);
 }
 
+typedef struct {
+    AdviceResult result;
+    double strategySpeedKmh;
+    int nativeRecommendedSpeedKmh;
+    BOOL validInput;
+} LiveAdviceSnapshot;
+
+static LiveAdviceSnapshot ComputeLiveAdvice(
+    LampState state, const ActiveSignalSnapshot *active) {
+    LiveAdviceSnapshot snapshot = {0};
+    snapshot.result.action = AdviceUnavailable;
+    if (!active || active->candidateCount != 1 || active->signalId == 0 ||
+        active->distanceMeters < 0)
+        return snapshot;
+
+    double wallNow = WallSeconds();
+    int travelMode = atomic_load_explicit(&gTravelMode, memory_order_relaxed);
+    uint64_t phaseRows[kMaxCyclingPhases * 3];
+    uint32_t phaseCount = 0;
+    double adviceNow = wallNow;
+    double strategySpeedKmh = -1.0;
+    int sourceDistance = active->distanceMeters;
+    int nativeRecommendedSpeedKmh = -1;
+
+    TravelAdviceSnapshot native = {0};
+    BOOL synchronized = LoadTravelAdviceSnapshot(&native) &&
+        wallNow - native.capturedAt >= 0.0 &&
+        wallNow - native.capturedAt <= 2.5 &&
+        native.signalId == active->signalId &&
+        abs(native.distanceMeters - active->distanceMeters) <= 6 &&
+        native.averageSpeedKmh >= 2 && native.averageSpeedKmh <= 40 &&
+        native.maximumWindows >= 1 && native.maximumWindows <= 5;
+    if (synchronized) {
+        phaseCount = native.phaseCount;
+        memcpy(phaseRows, native.phaseRows,
+               phaseCount * 3 * sizeof(uint64_t));
+        strategySpeedKmh = native.averageSpeedKmh;
+        sourceDistance = native.distanceMeters;
+        nativeRecommendedSpeedKmh = native.nativeRecommendedSpeedKmh;
+        adviceNow = (double)native.currentTimeSeconds;
+        if (!isfinite(adviceNow) || fabs(adviceNow - wallNow) > 5.0)
+            adviceNow = wallNow;
+    } else {
+        int currentSpeedKmh = atomic_load_explicit(
+            &gTravelCurrentSpeedKmh, memory_order_relaxed);
+        double speedUpdatedAt = atomic_load_explicit(
+            &gTravelNaviInfoUpdatedAt, memory_order_relaxed);
+        uint64_t tableSignalId = 0;
+        if (currentSpeedKmh < 2 || currentSpeedKmh > 40 ||
+            wallNow - speedUpdatedAt < 0.0 ||
+            wallNow - speedUpdatedAt > 2.5 ||
+            !LoadTaggedCyclingTable(phaseRows, &phaseCount,
+                                    &tableSignalId) ||
+            tableSignalId != active->signalId)
+            return snapshot;
+        strategySpeedKmh = currentSpeedKmh;
+    }
+
+    AdviceGreenWindow windows[kMaxAdviceGreenWindows];
+    size_t windowCount = BuildAdviceGreenWindows(
+        phaseRows, phaseCount, adviceNow, windows, kMaxAdviceGreenWindows);
+    if (!windowCount) return snapshot;
+
+    if (active->signalId != gAdviceSignalId) {
+        gAdviceSignalId = active->signalId;
+        gPreferredAdviceWindowStart = 0.0;
+    }
+    AdviceConfig config = AdviceDefaultConfig();
+    config.minimumRollingSpeedMps = 5.0 / 3.6;
+    config.minimumCurrentSpeedMps = 0.5;
+    config.maximumSpeedMps = (travelMode == 4 ? 25.0 : 20.0) / 3.6;
+    AdviceInput input = {
+        .nowEpochSeconds = adviceNow,
+        .distanceMeters = (double)sourceDistance,
+        .currentSpeedMps = strategySpeedKmh / 3.6,
+        .greenWindows = windows,
+        .greenWindowCount = windowCount,
+        .allowAcceleration = state != LampYellow,
+        .preferredWindowStartEpochSeconds = gPreferredAdviceWindowStart,
+        .windowSwitchImprovementMps = 0.5,
+    };
+    snapshot.result = AdviceCompute(&input, &config);
+    snapshot.strategySpeedKmh = strategySpeedKmh;
+    snapshot.nativeRecommendedSpeedKmh = nativeRecommendedSpeedKmh;
+    snapshot.validInput = YES;
+    if (snapshot.result.available &&
+        snapshot.result.action != AdvicePrepareStop &&
+        snapshot.result.action != AdviceUnavailable)
+        gPreferredAdviceWindowStart =
+            snapshot.result.windowStartEpochSeconds;
+    else if (snapshot.result.action == AdvicePrepareStop)
+        gPreferredAdviceWindowStart = 0.0;
+    return snapshot;
+}
+
+static int DisplaySpeedKmh(BOOL *usesAverage) {
+    if (usesAverage) *usesAverage = NO;
+    double wallNow = WallSeconds();
+    int currentSpeed = atomic_load_explicit(
+        &gTravelCurrentSpeedKmh, memory_order_relaxed);
+    double currentUpdatedAt = atomic_load_explicit(
+        &gTravelNaviInfoUpdatedAt, memory_order_relaxed);
+    if (currentSpeed >= 0 && currentSpeed <= 40 &&
+        wallNow - currentUpdatedAt >= 0.0 &&
+        wallNow - currentUpdatedAt <= 10.0)
+        return currentSpeed;
+
+    TravelAdviceSnapshot native = {0};
+    if (LoadTravelAdviceSnapshot(&native) &&
+        native.averageSpeedKmh >= 0 && native.averageSpeedKmh <= 40 &&
+        wallNow - native.capturedAt >= 0.0 &&
+        wallNow - native.capturedAt <= 2.5) {
+        if (usesAverage) *usesAverage = YES;
+        return native.averageSpeedKmh;
+    }
+    return -1;
+}
+
 static void UpdateOverlay(void) {
     if (!gBall) return;
     double now = MonotonicSeconds();
     LampState state = LampUnknown;
+    CountdownSource countdownSource = CountdownSourceUnknown;
     double phaseEnd = 0, updatedAt = 0;
-    BOOL snapshotReady = LoadDisplayState(&state, &phaseEnd, &updatedAt);
+    BOOL snapshotReady = LoadDisplayState(
+        &state, &phaseEnd, &updatedAt, &countdownSource);
     double remaining = phaseEnd - now;
+    double displayAge = now - updatedAt;
+    double maximumRemaining = IsCarCountdownSource(countdownSource) ? 999.0 : 180.0;
     int seconds = -1;
-    if (snapshotReady && updatedAt > 0 && now - updatedAt <= 2.5 &&
-        remaining >= -0.2 && remaining <= 180.0 && state != LampUnknown)
-        seconds = remaining > 0 ? (int)ceil(remaining) : 0;
-    if (seconds < 0) state = LampUnknown;
+    const char *hiddenReason = "none";
+    if (!snapshotReady) hiddenReason = "snapshot-unavailable";
+    else if (updatedAt <= 0.0) hiddenReason = "no-display-sample";
+    else if (!isfinite(displayAge) || displayAge < 0.0 || displayAge > 2.5)
+        hiddenReason = "display-age-2.5s";
+    else if (!isfinite(remaining) || remaining < -0.2)
+        hiddenReason = "phase-ended";
+    else if (remaining > maximumRemaining) hiddenReason = "remaining-out-of-range";
+    else if (state == LampUnknown) hiddenReason = "unknown-lamp";
+    else seconds = remaining > 0 ? (int)ceil(remaining) : 0;
+    if (seconds < 0) {
+        if (gCurrentSeconds >= 0) {
+            double carCapturedAt = atomic_load_explicit(
+                &gCarTableCapturedAt, memory_order_relaxed);
+            double carCaptureAt = atomic_load_explicit(
+                &gCarCaptureAt, memory_order_acquire);
+            LogLine("countdown hidden reason=%s previous=%d rawSource=%d remaining=%.1f displayAge=%.1f carTable=%s carTableAge=%.1f carTableId=%llu carCapture=%s carCaptureAge=%.1f carCaptureId=%llu serialized=%s rawInput=%s",
+                    hiddenReason, gCurrentSeconds, (int)countdownSource,
+                    remaining, displayAge, gCarTableRejectReason,
+                    carCapturedAt > 0.0 ? now - carCapturedAt : -1.0,
+                    (unsigned long long)atomic_load_explicit(
+                        &gCarTableSignalId, memory_order_relaxed),
+                    atomic_load_explicit(&gCarCaptureReason, memory_order_acquire),
+                    carCaptureAt > 0.0 ? now - carCaptureAt : -1.0,
+                    (unsigned long long)atomic_load_explicit(
+                        &gCarCaptureSignalId, memory_order_relaxed),
+                    gCarSerializedRejectReason, gRawCarRejectReason);
+        }
+        state = LampUnknown;
+        countdownSource = CountdownSourceUnknown;
+    }
     gCurrentSeconds = seconds;
+    static CountdownSource lastLoggedCountdownSource = CountdownSourceUnknown;
+    if (countdownSource != lastLoggedCountdownSource) {
+        lastLoggedCountdownSource = countdownSource;
+        LogLine("countdown source=%d seconds=%d", (int)countdownSource,
+                seconds);
+    }
 
-    int distance = atomic_load_explicit(&gActiveSignalRouteDistance,
-                                        memory_order_relaxed);
-    unsigned distanceCandidates = atomic_load_explicit(
-        &gActiveSignalRouteCandidateCount, memory_order_relaxed);
-    double distanceUpdatedAt = atomic_load_explicit(
-        &gActiveSignalRouteUpdatedAt, memory_order_relaxed);
-    double distanceAge = WallSeconds() - distanceUpdatedAt;
-    if (seconds < 0 || distanceCandidates != 1 || distance < 0 ||
-        distance > 2000 || distanceAge < 0 || distanceAge > 2.5)
+    ActiveSignalSnapshot active = {0};
+    BOOL activeReady = LoadActiveSignalSnapshot(&active);
+    int distance = active.distanceMeters;
+    double distanceAge = WallSeconds() - active.updatedAt;
+    if (countdownSource != CountdownSourceTravel || !activeReady ||
+        seconds < 0 || active.candidateCount != 1 ||
+        active.signalId == 0 || distance < 0 || distance > 2000 ||
+        distanceAge < 0 || distanceAge > 2.5)
         distance = -1;
 
+    BOOL speedUsesAverage = NO;
+    int displaySpeedKmh = DisplaySpeedKmh(&speedUsesAverage);
     char secondsText[16];
     char distanceText[32];
     char unitText[64];
+    char speedText[64];
     snprintf(secondsText, sizeof(secondsText), seconds >= 0 ? "%d" : "--",
              seconds);
-    if (distance < 0) {
+    if (countdownSource == CountdownSourceCarInput) {
+        snprintf(distanceText, sizeof(distanceText), "原始取数");
+    } else if (IsCarCountdownSource(countdownSource)) {
+        snprintf(distanceText, sizeof(distanceText), "汽车参考");
+    } else if (distance < 0) {
         snprintf(distanceText, sizeof(distanceText), "--米");
     } else if (distance < 1000) {
         snprintf(distanceText, sizeof(distanceText), "%d米", distance);
@@ -1599,7 +2506,112 @@ static void UpdateOverlay(void) {
         snprintf(distanceText, sizeof(distanceText), "%.1f公里",
                  (double)distance / 1000.0);
     }
-    snprintf(unitText, sizeof(unitText), "秒 · 距路口 %s", distanceText);
+    if (countdownSource == CountdownSourceCarInput)
+        snprintf(unitText, sizeof(unitText), "秒 · 原始汽车信号参考");
+    else if (IsCarCountdownSource(countdownSource))
+        snprintf(unitText, sizeof(unitText), "秒 · 汽车信号参考");
+    else
+        snprintf(unitText, sizeof(unitText), "秒 · 距路口 %s", distanceText);
+    if (countdownSource == CountdownSourceCarInput) {
+        snprintf(speedText, sizeof(speedText), "取数模式 · 速度与距离暂不显示");
+    } else if (displaySpeedKmh < 0) {
+        snprintf(speedText, sizeof(speedText), "当前速度 -- km/h");
+    } else if (speedUsesAverage) {
+        snprintf(speedText, sizeof(speedText), "平均速度 %d km/h",
+                 displaySpeedKmh);
+    } else {
+        snprintf(speedText, sizeof(speedText), "当前速度 %d km/h",
+                 displaySpeedKmh);
+    }
+
+    LiveAdviceSnapshot advice = {0};
+    advice.result.action = AdviceUnavailable;
+    if (seconds >= 0 && distance >= 0)
+        advice = ComputeLiveAdvice(state, &active);
+    advice.result = AdviceStabilize(
+        &gAdviceStabilizer, advice.result,
+        distance >= 0 ? active.signalId : 0, WallSeconds(),
+        advice.strategySpeedKmh / 3.6, 2.0, 0.15);
+    char adviceActionText[96];
+    char adviceDetailText[128];
+    AdviceResult decision = advice.result;
+    double targetKmh = decision.targetSpeedMps * 3.6;
+    double deltaKmh = decision.speedDeltaMps * 3.6;
+    unsigned arrivalSeconds = isfinite(decision.predictedArrivalSeconds)
+        ? (unsigned)ceil(decision.predictedArrivalSeconds) : 0;
+    unsigned greenRound = decision.windowIndex + 1;
+    switch (decision.action) {
+        case AdviceMaintain:
+            snprintf(adviceActionText, sizeof(adviceActionText),
+                     "保持当前速度");
+            snprintf(adviceDetailText, sizeof(adviceDetailText),
+                     "计算均速 %.0f km/h · 预计%u秒后第%u轮绿灯通过",
+                     advice.strategySpeedKmh, arrivalSeconds, greenRound);
+            break;
+        case AdviceAccelerate:
+            snprintf(adviceActionText, sizeof(adviceActionText),
+                     "缓慢提速至 %.1f km/h", targetKmh);
+            snprintf(adviceDetailText, sizeof(adviceDetailText),
+                     "计算均速 %.0f · 提速 %.1f km/h · 预计%u秒后到达",
+                     advice.strategySpeedKmh, fabs(deltaKmh), arrivalSeconds);
+            break;
+        case AdviceDecelerate:
+            snprintf(adviceActionText, sizeof(adviceActionText),
+                     "缓慢减速至 %.1f km/h", targetKmh);
+            snprintf(adviceDetailText, sizeof(adviceDetailText),
+                     "计算均速 %.0f · 减速 %.1f km/h · 预计%u秒后到达",
+                     advice.strategySpeedKmh, fabs(deltaKmh), arrivalSeconds);
+            break;
+        case AdviceReduceToLimit:
+            snprintf(adviceActionText, sizeof(adviceActionText),
+                     "请减速至 %.0f km/h", targetKmh);
+            snprintf(adviceDetailText, sizeof(adviceDetailText),
+                     "当前 %.0f km/h · 已超过当前骑行模式建议上限",
+                     advice.strategySpeedKmh);
+            break;
+        case AdvicePrepareStop:
+            snprintf(adviceActionText, sizeof(adviceActionText),
+                     "本轮不建议追赶");
+            snprintf(adviceDetailText, sizeof(adviceDetailText),
+                     "提前减速并准备停车");
+            break;
+        case AdviceUnavailable:
+        default: {
+            if (countdownSource == CountdownSourceCarInput) {
+                snprintf(adviceActionText, sizeof(adviceActionText),
+                         "取数优先：仅显示倒计时");
+                snprintf(adviceDetailText, sizeof(adviceDetailText),
+                         "未修改定位 · 暂不计算速度建议");
+                break;
+            }
+            const char *waitingText = distance < 0
+                ? "等待路口距离"
+                : (displaySpeedKmh < 2 ? "等待骑行速度"
+                                       : "等待同步相位数据");
+            snprintf(adviceActionText, sizeof(adviceActionText), "%s",
+                     waitingText);
+            snprintf(adviceDetailText, sizeof(adviceDetailText),
+                     "速度、距离和相位有效后自动计算");
+            break;
+        }
+    }
+    static AdviceAction lastLoggedAdviceAction = AdviceUnavailable;
+    static int lastLoggedTargetTenths = -1;
+    static double lastAdviceLogAt;
+    int targetTenths = (int)llround(targetKmh * 10.0);
+    double adviceLogNow = WallSeconds();
+    if (decision.action != lastLoggedAdviceAction ||
+        targetTenths != lastLoggedTargetTenths ||
+        adviceLogNow - lastAdviceLogAt >= 10.0) {
+        lastLoggedAdviceAction = decision.action;
+        lastLoggedTargetTenths = targetTenths;
+        lastAdviceLogAt = adviceLogNow;
+        LogLine("strategy action=%d distance=%d current=%d average=%.1f target=%.1f delta=%.1f arrival=%u green=%u nativeRec=%d",
+                (int)decision.action, distance, displaySpeedKmh,
+                advice.strategySpeedKmh, targetKmh, deltaKmh,
+                arrivalSeconds, greenRound,
+                advice.nativeRecommendedSpeedKmh);
+    }
     id textColor = LampTextColor(state);
     MsgVoidObj(gBall, "setBackgroundColor:", LampBackground(state, NO));
     MsgVoidObj(gBallLampLabel, "setTextColor:", textColor);
@@ -1614,10 +2626,18 @@ static void UpdateOverlay(void) {
         MsgVoidObj(gFullLampLabel, "setTextColor:", textColor);
         MsgVoidObj(gFullSecondsLabel, "setTextColor:", textColor);
         MsgVoidObj(gFullUnitLabel, "setTextColor:", textColor);
+        MsgVoidObj(gFullSpeedLabel, "setTextColor:", textColor);
+        MsgVoidObj(gFullAdviceActionLabel, "setTextColor:", textColor);
+        MsgVoidObj(gFullAdviceDetailLabel, "setTextColor:", textColor);
         MsgVoidObj(gFullDisclaimerLabel, "setTextColor:", textColor);
         MsgVoidObj(gFullLampLabel, "setText:", NSStr(LampName(state)));
         MsgVoidObj(gFullSecondsLabel, "setText:", NSStr(secondsText));
         MsgVoidObj(gFullUnitLabel, "setText:", NSStr(unitText));
+        MsgVoidObj(gFullSpeedLabel, "setText:", NSStr(speedText));
+        MsgVoidObj(gFullAdviceActionLabel, "setText:",
+                   NSStr(adviceActionText));
+        MsgVoidObj(gFullAdviceDetailLabel, "setText:",
+                   NSStr(adviceDetailText));
     }
 }
 
@@ -1651,15 +2671,40 @@ static void Tick(id self, SEL command, id timer) {
     (void)timer;
     static _Atomic double lastAlive;
     static unsigned lastTrafficSignalGeneration;
-    static unsigned lastSignalDistanceGeneration;
-    static unsigned lastRouteDistanceGeneration;
-    static unsigned lastGuideLightBuildGeneration;
-    static unsigned lastGuideLightFormatGeneration;
-    static unsigned lastFirstLightStatsGeneration;
-    static unsigned lastRouteSummaryGeneration;
     static unsigned lastActiveSignalRouteGeneration;
     static int lastLoggedActiveSignalDistance = -2;
     static double lastActiveSignalRouteLogAt;
+    static unsigned lastTravelNaviInfoGeneration;
+    static int lastLoggedTravelSpeed = -2;
+    static double lastTravelSpeedLogAt;
+    unsigned travelNaviInfoGeneration = atomic_load_explicit(
+        &gTravelNaviInfoGeneration, memory_order_acquire);
+    if (travelNaviInfoGeneration != lastTravelNaviInfoGeneration) {
+        lastTravelNaviInfoGeneration = travelNaviInfoGeneration;
+        int currentSpeed = atomic_load_explicit(
+            &gTravelCurrentSpeedKmh, memory_order_relaxed);
+        double logNow = WallSeconds();
+        if (currentSpeed != lastLoggedTravelSpeed ||
+            logNow - lastTravelSpeedLogAt >= 10.0) {
+            lastLoggedTravelSpeed = currentSpeed;
+            lastTravelSpeedLogAt = logNow;
+            LogLine("travel speed current=%d average=%d nativeRec=%d distance=%d mode=%d navStatus=%d age=%.1f gen=%u",
+                    currentSpeed,
+                    atomic_load_explicit(&gTravelAverageSpeedKmh,
+                                         memory_order_relaxed),
+                    atomic_load_explicit(&gTravelNativeRecommendedSpeedKmh,
+                                         memory_order_relaxed),
+                    atomic_load_explicit(&gTravelAdviceDistanceMeters,
+                                         memory_order_relaxed),
+                    atomic_load_explicit(&gTravelMode,
+                                         memory_order_relaxed),
+                    atomic_load_explicit(&gTravelNavigationStatus,
+                                         memory_order_relaxed),
+                    logNow - atomic_load_explicit(
+                        &gTravelNaviInfoUpdatedAt, memory_order_relaxed),
+                    travelNaviInfoGeneration);
+        }
+    }
     unsigned trafficSignalGeneration = atomic_load_explicit(
         &gTrafficSignalGeneration, memory_order_acquire);
     if (trafficSignalGeneration != lastTrafficSignalGeneration) {
@@ -1677,40 +2722,6 @@ static void Tick(id self, SEL command, id timer) {
         LogLine("dynamic signal outer=%u inner=%u phases=%u published=%u table=%u gen=%u",
                 outerCount, innerCount, phaseCount, publishedCount,
                 tableCount, trafficSignalGeneration);
-        unsigned captured = phaseCount < 4 ? phaseCount : 4;
-        for (unsigned i = 0; i < captured; ++i) {
-            int32_t code = (int32_t)atomic_load_explicit(
-                &gTrafficSignalPhaseRows[i * 3], memory_order_relaxed);
-            int64_t startsAt = (int64_t)atomic_load_explicit(
-                &gTrafficSignalPhaseRows[i * 3 + 1], memory_order_relaxed);
-            int64_t endsAt = (int64_t)atomic_load_explicit(
-                &gTrafficSignalPhaseRows[i * 3 + 2], memory_order_relaxed);
-            LogLine("dynamic phase[%u] code=%d start=%lld end=%lld", i,
-                    code, (long long)startsAt, (long long)endsAt);
-        }
-    }
-    unsigned signalDistanceGeneration = atomic_load_explicit(
-        &gSignalDistanceGeneration, memory_order_acquire);
-    if (signalDistanceGeneration != lastSignalDistanceGeneration) {
-        lastSignalDistanceGeneration = signalDistanceGeneration;
-        int distance = atomic_load_explicit(
-            &gSignalDistanceMeters, memory_order_relaxed);
-        unsigned candidates = atomic_load_explicit(
-            &gSignalDistanceCandidateCount, memory_order_relaxed);
-        int currentOffset = atomic_load_explicit(
-            &gSignalDistanceCurrentOffset, memory_order_relaxed);
-        int targetOffset = atomic_load_explicit(
-            &gSignalDistanceTargetOffset, memory_order_relaxed);
-        uint64_t linkId = atomic_load_explicit(
-            &gSignalDistanceLinkId, memory_order_relaxed);
-        uint32_t currentLink = atomic_load_explicit(
-            &gSignalDistanceCurrentLink, memory_order_relaxed);
-        double updatedAt = atomic_load_explicit(
-            &gSignalDistanceUpdatedAt, memory_order_relaxed);
-        LogLine("native signal distance=%d candidates=%u current=%d target=%d link=%llu navlink=%u age=%.1f gen=%u",
-                distance, candidates, currentOffset, targetOffset,
-                (unsigned long long)linkId, currentLink,
-                WallSeconds() - updatedAt, signalDistanceGeneration);
     }
     unsigned activeSignalRouteGeneration = atomic_load_explicit(
         &gActiveSignalRouteGeneration, memory_order_acquire);
@@ -1740,74 +2751,6 @@ static void Tick(id self, SEL command, id timer) {
                     activeSignalRouteGeneration);
         }
     }
-    unsigned guideBuildGeneration = atomic_load_explicit(
-        &gGuideLightBuildGeneration, memory_order_acquire);
-    unsigned guideFormatGeneration = atomic_load_explicit(
-        &gGuideLightFormatGeneration, memory_order_acquire);
-    if (guideBuildGeneration != lastGuideLightBuildGeneration ||
-        guideFormatGeneration != lastGuideLightFormatGeneration) {
-        lastGuideLightBuildGeneration = guideBuildGeneration;
-        lastGuideLightFormatGeneration = guideFormatGeneration;
-        LogLine("guide light distance=%d before=%d base=%d mode=%d index=%llu build=%u format=%u age=%.1f",
-                atomic_load_explicit(&gGuideLightDistanceMeters,
-                                     memory_order_relaxed),
-                atomic_load_explicit(&gGuideLightDistanceBefore,
-                                     memory_order_relaxed),
-                atomic_load_explicit(&gGuideLightRouteBase,
-                                     memory_order_relaxed),
-                atomic_load_explicit(&gGuideLightRouteMode,
-                                     memory_order_relaxed),
-                (unsigned long long)atomic_load_explicit(
-                    &gGuideLightRouteIndex, memory_order_relaxed),
-                guideBuildGeneration, guideFormatGeneration,
-                WallSeconds() - atomic_load_explicit(
-                    &gGuideLightUpdatedAt, memory_order_relaxed));
-    }
-    unsigned firstLightStatsGeneration = atomic_load_explicit(
-        &gFirstLightStatsGeneration, memory_order_acquire);
-    if (firstLightStatsGeneration != lastFirstLightStatsGeneration) {
-        lastFirstLightStatsGeneration = firstLightStatsGeneration;
-        LogLine("first light stats count=%d distance=%d time=%d gen=%u",
-                atomic_load_explicit(&gFirstLightTotalCount,
-                                     memory_order_relaxed),
-                atomic_load_explicit(&gFirstLightDistanceMeters,
-                                     memory_order_relaxed),
-                atomic_load_explicit(&gFirstLightTimeSeconds,
-                                     memory_order_relaxed),
-                firstLightStatsGeneration);
-    }
-    unsigned routeSummaryGeneration = atomic_load_explicit(
-        &gRouteSummaryGeneration, memory_order_acquire);
-    if (routeSummaryGeneration != lastRouteSummaryGeneration) {
-        lastRouteSummaryGeneration = routeSummaryGeneration;
-        LogLine("route summary etaDistance=%d etaTime=%d remainingLights=%d gen=%u",
-                atomic_load_explicit(&gRouteSummaryEtaDistance,
-                                     memory_order_relaxed),
-                atomic_load_explicit(&gRouteSummaryEtaTime,
-                                     memory_order_relaxed),
-                atomic_load_explicit(&gRouteSummaryRemainingLights,
-                                     memory_order_relaxed),
-                routeSummaryGeneration);
-    }
-    unsigned routeDistanceGeneration = atomic_load_explicit(
-        &gRouteDistanceGeneration, memory_order_acquire);
-    if (routeDistanceGeneration != lastRouteDistanceGeneration) {
-        lastRouteDistanceGeneration = routeDistanceGeneration;
-        int envelopeDistance = atomic_load_explicit(
-            &gRouteDistanceEnvelopeMeters, memory_order_relaxed);
-        int contextDistance = atomic_load_explicit(
-            &gRouteDistanceContextMeters, memory_order_relaxed);
-        uintptr_t envelopeObject = atomic_load_explicit(
-            &gRouteDistanceEnvelopeObject, memory_order_relaxed);
-        uintptr_t contextObject = atomic_load_explicit(
-            &gRouteDistanceContextObject, memory_order_relaxed);
-        double updatedAt = atomic_load_explicit(
-            &gRouteDistanceUpdatedAt, memory_order_relaxed);
-        LogLine("route distance envelope=%d object=%p context=%d object=%p age=%.1f gen=%u",
-                envelopeDistance, (void *)envelopeObject, contextDistance,
-                (void *)contextObject, WallSeconds() - updatedAt,
-                routeDistanceGeneration);
-    }
     double anow = WallSeconds();
     if (anow - atomic_load_explicit(&lastAlive, memory_order_relaxed) > 15.0) {
         atomic_store_explicit(&lastAlive, anow, memory_order_relaxed);
@@ -1816,9 +2759,19 @@ static void Tick(id self, SEL command, id timer) {
     }
     EnsureOverlay(KeyWindow());
     double monotonicNow = MonotonicSeconds();
-    if (monotonicNow - atomic_load_explicit(
-            &gCarUpdatedAt, memory_order_acquire) > 2.5)
-        PublishLiveCyclingPhase(WallSeconds(), monotonicNow);
+    double wallNow = WallSeconds();
+    unsigned displayGenerationBeforeSources = atomic_load_explicit(
+        &gDisplayGeneration, memory_order_acquire);
+    gCarTableRejectReason = "higher-priority-source";
+    gCarSerializedRejectReason = "higher-priority-source";
+    gRawCarRejectReason = "higher-priority-source";
+    if (!PublishLiveCyclingPhase(wallNow, monotonicNow) &&
+        !PublishSerializedCarCountdown(wallNow, monotonicNow) &&
+        !PublishLiveCarPhase(wallNow, monotonicNow, displayGenerationBeforeSources)) {
+        if (!PublishRawCarCountdown(wallNow, monotonicNow,
+                                    displayGenerationBeforeSources))
+            InvalidateUnselectedCarDisplay();
+    }
     UpdateOverlay();
 }
 
@@ -1855,7 +2808,7 @@ static void Start(id self, SEL command, id argument) {
             center, S("addObserver:selector:name:object:"), gController,
             S("dsh_foreground:"), NSStr("UIApplicationWillEnterForegroundNotification"), 0);
     }
-    LogLine("countdown HUD started; no OCR, network, GPS collection, geospatial distance inference, speed, or advice");
+    LogLine("countdown HUD started; native travel speed advice enabled; no OCR, network, GPS/Core Location collection, or geospatial distance inference");
 }
 
 __attribute__((constructor)) static void AMapSignalCountdownInit(void) {
