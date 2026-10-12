@@ -4,12 +4,15 @@
 // geospatial distance inference, or view-tree scanning.
 
 #include "AdviceStrategy.h"
+#include "SignalRoute.h"
+#include "SignalCapture.h"
 
 #ifndef DSH_PLUGIN_VERSION
 #define DSH_PLUGIN_VERSION "development"
 #endif
 
 #include <dlfcn.h>
+#include <errno.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -18,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <time.h>
 
 typedef signed char BOOL;
@@ -353,6 +357,43 @@ typedef struct {
     uint64_t signalId;
     double updatedAt;
 } ActiveSignalSnapshot;
+
+// Engine callbacks publish deep copies only. SQLite and route selection stay
+// on the main thread; no native pointer is retained past a callback.
+#define kMaxUpcomingSignals 64
+typedef struct {
+    uint64_t sequence;
+    uint64_t navigationEpoch;
+    double capturedAt;
+    int currentOffset;
+    BOOL valid;
+    size_t count;
+    SRSignal signals[kMaxUpcomingSignals];
+} UpcomingSignalSnapshot;
+static UpcomingSignalSnapshot gUpcomingCarSignals;
+static UpcomingSignalSnapshot gUpcomingTravelSignals;
+static atomic_flag gUpcomingCarLock = ATOMIC_FLAG_INIT;
+static atomic_flag gUpcomingTravelLock = ATOMIC_FLAG_INIT;
+static _Atomic uint64_t gUpcomingCarSequence;
+static _Atomic uint64_t gUpcomingTravelSequence;
+static _Atomic uint64_t gNativeNavigationEpoch = 1;
+static _Atomic uint64_t gRouteContextEpoch = 1;
+static uint64_t gAppliedNativeNavigationEpoch;
+static uint64_t gAppliedRouteContextEpoch;
+static SHStore *gSignalHistory;
+static SRRoute *gSignalRoute;
+// Once the route pipeline is active, stale/empty data must stay in waiting
+// state rather than falling back to a legacy lamp without its blacklist.
+static BOOL gRouteSnapshotAvailable;
+static BOOL gHasCapturedRoute;
+static BOOL gHistoryOpenAttempted;
+static int ReadKnownInt32(const void *base, size_t offset);
+static void CaptureUpcomingTravel(void *processor, int currentOffset);
+static void CaptureUpcomingCar(const void *feed, const void *navigationState);
+static void RefreshUpcomingRoute(void);
+static void ResetSignalRouteContext(void);
+static void RequestSignalRouteReset(void);
+
 static id gController;
 static id gTimer;
 static id gBall;
@@ -367,6 +408,29 @@ static id gFullSpeedLabel;
 static id gFullAdviceActionLabel;
 static id gFullAdviceDetailLabel;
 static id gFullDisclaimerLabel;
+static id gFullIdentityLabel;
+static id gFullSourceLabel;
+static id gManagementButton;
+static id gPreviewView[2];
+static id gPreviewLampLabel[2];
+static id gPreviewSecondsLabel[2];
+static id gPreviewIdentityLabel[2];
+static id gPreviewSourceLabel[2];
+static id gManagementView;
+static id gManagementScroll;
+static id gManagementNameField;
+static id gManagementRoadField;
+static id gManagementMessageLabel;
+static id gManagementCloseButton;
+static id gManagementResetButton;
+static SHEntry *gManagementEntries;
+static size_t gManagementEntryCount;
+static uint64_t gManagementSignalId;
+static int gManagementTargetOffset;
+static BOOL gManagementTargetValid;
+static uint64_t gManagementRouteEpoch;
+static CGFloat gManagementLayoutWidth;
+static void LayoutSignalManagement(id window);
 static double gPreferredAdviceWindowStart;
 static uint64_t gAdviceSignalId;
 static AdviceStabilizer gAdviceStabilizer;
@@ -1352,9 +1416,16 @@ static int64_t HookTravelNaviInfoSerialize(const uint8_t *info, void *writer) {
     atomic_store_explicit(&gTravelCurrentSpeedKmh,
                           speedKmh >= 0 && speedKmh <= 100 ? speedKmh : -1,
                           memory_order_relaxed);
-    atomic_store_explicit(&gTravelMode, travelMode, memory_order_relaxed);
-    atomic_store_explicit(&gTravelNavigationStatus, navigationStatus,
-                          memory_order_relaxed);
+    int previousMode = atomic_exchange_explicit(
+        &gTravelMode, travelMode, memory_order_relaxed);
+    int previousStatus = atomic_exchange_explicit(
+        &gTravelNavigationStatus, navigationStatus, memory_order_relaxed);
+    // These fields are verified; their enum meanings and a durable native
+    // navigation ID are not. Any observed change invalidates manual bindings.
+    if ((previousMode >= 0 && travelMode >= 0 && previousMode != travelMode) ||
+        (previousStatus >= 0 && navigationStatus >= 0 &&
+         previousStatus != navigationStatus))
+        RequestSignalRouteReset();
     atomic_store_explicit(&gTravelNaviInfoUpdatedAt, WallSeconds(),
                           memory_order_relaxed);
     atomic_fetch_add_explicit(&gTravelNaviInfoGeneration, 1,
@@ -1390,6 +1461,200 @@ static int32_t HookTravelRecommendSpeed(void *provider, void *phases,
     return result;
 }
 
+static void PublishUpcomingSnapshot(UpcomingSignalSnapshot *destination,
+                                    atomic_flag *lock,
+                                    const UpcomingSignalSnapshot *snapshot) {
+    while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire)) {}
+    if (snapshot->navigationEpoch > destination->navigationEpoch ||
+        (snapshot->navigationEpoch == destination->navigationEpoch &&
+         snapshot->sequence >= destination->sequence))
+        memcpy(destination, snapshot, sizeof(*destination));
+    atomic_flag_clear_explicit(lock, memory_order_release);
+}
+
+static void CopyUpcomingSnapshot(UpcomingSignalSnapshot *destination,
+                                 const UpcomingSignalSnapshot *source,
+                                 atomic_flag *lock) {
+    while (atomic_flag_test_and_set_explicit(lock, memory_order_acquire)) {}
+    memcpy(destination, source, sizeof(*destination));
+    atomic_flag_clear_explicit(lock, memory_order_release);
+}
+
+static void CaptureUpcomingCar(const void *feed, const void *navigationState) {
+    uint64_t epoch = atomic_load_explicit(
+        &gNativeNavigationEpoch, memory_order_acquire);
+    uint64_t sequence = atomic_fetch_add_explicit(
+        &gUpcomingCarSequence, 1, memory_order_relaxed) + 1;
+    UpcomingSignalSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot) return;
+    snapshot->sequence = sequence;
+    snapshot->navigationEpoch = epoch;
+    snapshot->capturedAt = WallSeconds();
+    snapshot->currentOffset = ReadKnownInt32(navigationState, 0x0c);
+    snapshot->valid = SCReadCar(feed, snapshot->currentOffset,
+        snapshot->capturedAt, snapshot->signals, kMaxUpcomingSignals,
+        &snapshot->count) ? YES : NO;
+    PublishUpcomingSnapshot(&gUpcomingCarSignals, &gUpcomingCarLock, snapshot);
+    free(snapshot);
+}
+
+static void CaptureUpcomingTravel(void *processor, int currentOffset) {
+    uint64_t epoch = atomic_load_explicit(
+        &gNativeNavigationEpoch, memory_order_acquire);
+    uint64_t sequence = atomic_fetch_add_explicit(
+        &gUpcomingTravelSequence, 1, memory_order_relaxed) + 1;
+    UpcomingSignalSnapshot *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot) return;
+    snapshot->sequence = sequence;
+    snapshot->navigationEpoch = epoch;
+    snapshot->capturedAt = WallSeconds();
+    snapshot->currentOffset = currentOffset;
+    snapshot->valid = SCReadTravel(processor, currentOffset,
+        snapshot->capturedAt, snapshot->signals, kMaxUpcomingSignals,
+        &snapshot->count) ? YES : NO;
+    PublishUpcomingSnapshot(&gUpcomingTravelSignals, &gUpcomingTravelLock, snapshot);
+    free(snapshot);
+}
+
+static void EnsureSignalHistory(void) {
+    if (gHistoryOpenAttempted) return;
+    gHistoryOpenAttempted = YES;
+    char directory[1024] = {0};
+    id manager = MsgId((id)C("NSFileManager"), "defaultManager");
+    id urls = manager ? ((id (*)(id, SEL, NSUInteger, NSUInteger))objc_msgSend)(
+        manager, S("URLsForDirectory:inDomains:"), 14, 1) : (id)0;
+    id path = Count(urls) ? MsgId(At(urls, 0), "path") : (id)0;
+    const char *support = path ? ((const char *(*)(id, SEL))objc_msgSend)(
+        path, S("UTF8String")) : NULL;
+    if (support && *support) {
+        int length = snprintf(directory, sizeof(directory), "%s", support);
+        if (length < 0 || (size_t)length >= sizeof(directory)) directory[0] = 0;
+    } else {
+        const char *appHome = getenv("HOME");
+        if (appHome && *appHome) {
+            int length = snprintf(directory, sizeof(directory),
+                "%s/Library/Application Support", appHome);
+            if (length < 0 || (size_t)length >= sizeof(directory)) directory[0] = 0;
+        }
+    }
+    if (directory[0] && (mkdir(directory, 0700) == 0 || errno == EEXIST)) {
+        char historyDirectory[1200], databasePath[1280];
+        int length = snprintf(historyDirectory, sizeof(historyDirectory),
+                              "%s/AMapSignalCountdown", directory);
+        if (length > 0 && (size_t)length < sizeof(historyDirectory) &&
+            (mkdir(historyDirectory, 0700) == 0 || errno == EEXIST)) {
+            length = snprintf(databasePath, sizeof(databasePath),
+                              "%s/Signals.sqlite3", historyDirectory);
+            if (length > 0 && (size_t)length < sizeof(databasePath))
+                gSignalHistory = SHOpen(databasePath);
+        }
+    }
+    // A storage error must not disable native countdowns.
+    gSignalRoute = SRCreate(gSignalHistory);
+    LogLine("signal history open=%d route=%d manual entering-road binding required",
+            gSignalHistory != NULL, gSignalRoute != NULL);
+}
+
+static void RequestSignalRouteReset(void) {
+    atomic_fetch_add_explicit(&gNativeNavigationEpoch, 1, memory_order_acq_rel);
+    atomic_fetch_add_explicit(&gRouteContextEpoch, 1, memory_order_acq_rel);
+}
+
+// Called on the main thread by the management page and app lifecycle hooks.
+// Keep all persistent identities, durations and blacklist choices intact.
+static void ResetSignalRouteContext(void) {
+    RequestSignalRouteReset();
+    if (gSignalRoute) SRReset(gSignalRoute);
+    gHasCapturedRoute = YES;
+    gRouteSnapshotAvailable = YES;
+}
+
+static void RefreshUpcomingRoute(void) {
+    EnsureSignalHistory();
+    if (!gSignalRoute) return;
+    UpcomingSignalSnapshot *snapshots = calloc(2, sizeof(*snapshots));
+    if (!snapshots) return;
+    CopyUpcomingSnapshot(&snapshots[0], &gUpcomingCarSignals, &gUpcomingCarLock);
+    CopyUpcomingSnapshot(&snapshots[1], &gUpcomingTravelSignals, &gUpcomingTravelLock);
+    double now = WallSeconds();
+    double carAge = now - snapshots[0].capturedAt;
+    double travelAge = now - snapshots[1].capturedAt;
+    double navigationAge = now - atomic_load_explicit(
+        &gTravelNaviInfoUpdatedAt, memory_order_acquire);
+    uint64_t navigationEpoch = atomic_load_explicit(
+        &gNativeNavigationEpoch, memory_order_acquire);
+    uint64_t routeContextEpoch = atomic_load_explicit(
+        &gRouteContextEpoch, memory_order_acquire);
+    BOOL travelNavigating = navigationAge >= 0.0 && navigationAge <= 2.5;
+    UpcomingSignalSnapshot *selected = NULL;
+    int source = 0;
+    if (snapshots[0].sequence || snapshots[1].sequence) gHasCapturedRoute = YES;
+    if (snapshots[1].sequence &&
+        snapshots[1].navigationEpoch == navigationEpoch &&
+        travelAge >= 0.0 && travelAge <= 2.5) {
+        // A malformed or empty fresh bicycle route must suppress an unrelated
+        // car/cached route rather than switching modes and guessing identity.
+        selected = &snapshots[1];
+        source = 2;
+    } else if (!travelNavigating && snapshots[0].sequence &&
+               snapshots[0].navigationEpoch == navigationEpoch &&
+               carAge >= 0.0 && carAge <= 2.5) {
+        selected = &snapshots[0];
+        source = 3;
+    }
+    static int previousSource;
+    static uint64_t previousNavigationEpoch;
+    static int previousOffset = -1;
+    static size_t previousCount;
+    static uint64_t previousIds[kMaxUpcomingSignals];
+    static int previousTargets[kMaxUpcomingSignals];
+    BOOL changed = source != previousSource ||
+        navigationEpoch != previousNavigationEpoch;
+    if (selected && selected->valid) {
+        // Native remaining route offset decreases as navigation advances.
+        // An increase or changed occurrence offsets invalidate manual binding.
+        if (previousOffset >= 0 && selected->currentOffset > previousOffset + 5)
+            changed = YES;
+        for (size_t i = 0; i < selected->count && !changed; ++i) {
+            BOOL sameId = NO, exactOccurrence = NO;
+            for (size_t j = 0; j < previousCount; ++j) {
+                if (selected->signals[i].id == previousIds[j]) {
+                    sameId = YES;
+                    if (selected->signals[i].targetOffset == previousTargets[j])
+                        exactOccurrence = YES;
+                }
+            }
+            if (sameId && !exactOccurrence) changed = YES;
+        }
+    }
+    if (changed) {
+        SRReset(gSignalRoute);
+        routeContextEpoch = atomic_fetch_add_explicit(
+            &gRouteContextEpoch, 1, memory_order_acq_rel) + 1;
+    }
+    gRouteSnapshotAvailable = selected != NULL || gHasCapturedRoute;
+    if (selected && selected->valid) {
+        if (!SRUpdate(gSignalRoute, selected->signals, selected->count, now))
+            LogLine("upcoming route update failed");
+        previousOffset = selected->currentOffset;
+        previousCount = selected->count;
+        for (size_t i = 0; i < previousCount; ++i) {
+            previousIds[i] = selected->signals[i].id;
+            previousTargets[i] = selected->signals[i].targetOffset;
+        }
+    } else {
+        SRUpdate(gSignalRoute, NULL, 0, now);
+        previousOffset = -1;
+        previousCount = 0;
+    }
+    previousSource = source;
+    previousNavigationEpoch = navigationEpoch;
+    gAppliedNativeNavigationEpoch = navigationEpoch;
+    gAppliedRouteContextEpoch = routeContextEpoch;
+    SRRefresh(gSignalRoute, now);
+    free(snapshots);
+}
+
 static int ReadKnownInt32(const void *base, size_t offset) {
     if (!PlausibleNativePointer((uintptr_t)base, 4)) return -1;
     int32_t value = -1;
@@ -1407,6 +1672,7 @@ static uintptr_t HookActiveTravelSignalRoute(void *processor, void *signals,
         ? gOriginalActiveTravelSignalRoute(processor, signals,
                                            navigationState) : 0;
     int currentOffset = ReadKnownInt32(navigationState, 0x0c);
+    CaptureUpcomingTravel(processor, currentOffset);
     int targetOffset = -1, rangeEnd = -1, distance = -1;
     uint64_t signalId = 0;
     unsigned candidateCount = 0;
@@ -1471,6 +1737,11 @@ static void HookDynamicTrafficSignalUpdate(void *processor, void *data,
                                            void *componentName) {
     if (gOriginalDynamicTrafficSignalUpdate)
         gOriginalDynamicTrafficSignalUpdate(processor, data, componentName);
+    double routeAge = WallSeconds() - atomic_load_explicit(
+        &gActiveSignalRouteUpdatedAt, memory_order_acquire);
+    if (routeAge >= 0.0 && routeAge <= 2.5)
+        CaptureUpcomingTravel(processor, atomic_load_explicit(
+            &gActiveSignalCurrentOffset, memory_order_relaxed));
     if (!PlausibleNativePointer((uintptr_t)processor, 8)) return;
 
     uint64_t begin = 0, end = 0;
@@ -1736,6 +2007,7 @@ static void ObserveRawCarTrafficInput(void *processor, const void *feed,
 // and the return register unchanged; do not move the user's location.
 static uintptr_t HookCarTrafficInput(void *processor, const void *feed,
                                      const void *navigationState) {
+    CaptureUpcomingCar(feed, navigationState);
     ObserveRawCarTrafficInput(processor, feed, navigationState);
     return gOriginalCarTrafficInput
         ? gOriginalCarTrafficInput(processor, feed, navigationState) : 0;
@@ -2051,6 +2323,388 @@ static void FitFullscreenNumberFont(CGFloat width, CGFloat height) {
             width, height);
 }
 
+static id CreateSignalView(const char *className, CGRect frame) {
+    Class cls = C(className);
+    if (!cls) return (id)0;
+    id allocated = ((id (*)(id, SEL))objc_msgSend)((id)cls, S("alloc"));
+    return ((id (*)(id, SEL, CGRect))objc_msgSend)(
+        allocated, S("initWithFrame:"), frame);
+}
+
+static void AddOwnedSignalSubview(id parent, id child) {
+    if (!child) return;
+    MsgVoidObj(parent, "addSubview:", child);
+    MsgVoid(child, "release");
+}
+
+static id CreateSignalButton(CGRect frame, const char *title,
+                             const char *action, NSInteger tag) {
+    id button = CreateSignalView("UIButton", frame);
+    if (!button) return (id)0;
+    ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(
+        button, S("setTitle:forState:"), NSStr(title), 0);
+    ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(
+        button, S("setTitleColor:forState:"), RGBA(1, 1, 1, 1), 0);
+    MsgVoidObj(button, "setBackgroundColor:", RGBA(0.18, 0.24, 0.31, 1));
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(button, S("setTag:"), tag);
+    ((void (*)(id, SEL, id, SEL, NSUInteger))objc_msgSend)(
+        button, S("addTarget:action:forControlEvents:"),
+        gController, S(action), 1UL << 6); /* UIControlEventTouchUpInside */
+    id titleLabel = MsgId(button, "titleLabel");
+    if (titleLabel) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(
+            titleLabel, S("setAdjustsFontSizeToFitWidth:"), YES);
+        Class fontClass = C("UIFont");
+        if (fontClass) {
+            id font = ((id (*)(id, SEL, CGFloat))objc_msgSend)(
+                (id)fontClass, S("boldSystemFontOfSize:"), 15.0);
+            MsgVoidObj(titleLabel, "setFont:", font);
+        }
+    }
+    return button;
+}
+
+static id CreateSignalTextField(CGRect frame, const char *placeholder,
+                                const char *value) {
+    id field = CreateSignalView("UITextField", frame);
+    if (!field) return (id)0;
+    MsgVoidObj(field, "setBackgroundColor:", RGBA(1, 1, 1, 1));
+    MsgVoidObj(field, "setTextColor:", RGBA(0.04, 0.05, 0.07, 1));
+    MsgVoidObj(field, "setPlaceholder:", NSStr(placeholder));
+    MsgVoidObj(field, "setText:", NSStr(value));
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(field, S("setBorderStyle:"), 3);
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(
+        field, S("setAutocorrectionType:"), 1);
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(
+        field, S("setAutocapitalizationType:"), 0);
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(field, S("setReturnKeyType:"), 9);
+    return field;
+}
+
+static void SignalManagementMessage(const char *text) {
+    MsgVoidObj(gManagementMessageLabel, "setText:", NSStr(text));
+}
+
+static void LayoutSignalManagement(id window) {
+    if (!window || !gManagementView) return;
+    CGRect bounds = MsgRect(window, "bounds");
+    CGFloat delta = bounds.size.width - gManagementLayoutWidth;
+    if (gManagementScroll && gManagementLayoutWidth > 0 && fabs(delta) > 0.5) {
+        id children = MsgId(gManagementScroll, "subviews");
+        NSUInteger count = Count(children);
+        for (NSUInteger index = 0; index < count; ++index) {
+            id child = At(children, index);
+            BOOL isButton = Responds(child, "setTitle:forState:");
+            if (!isButton && !Responds(child, "setPlaceholder:") &&
+                !Responds(child, "setNumberOfLines:")) continue;
+            CGRect frame = MsgRect(child, "frame");
+            BOOL halfWidth = isButton &&
+                             frame.size.width < gManagementLayoutWidth - 40;
+            frame.size.width += halfWidth ? delta / 2.0 : delta;
+            if (halfWidth && frame.origin.x > 20) frame.origin.x += delta / 2.0;
+            SetRect(child, "setFrame:", frame);
+        }
+        CGSize content = ((CGSize (*)(id, SEL))objc_msgSend)(
+            gManagementScroll, S("contentSize"));
+        content.width = bounds.size.width;
+        ((void (*)(id, SEL, CGSize))objc_msgSend)(
+            gManagementScroll, S("setContentSize:"), content);
+    }
+    gManagementLayoutWidth = bounds.size.width;
+    SetRect(gManagementView, "setFrame:", bounds);
+    CGFloat top = bounds.size.height > 600.0 ? 46.0 : 8.0;
+    SetRect(gManagementCloseButton, "setFrame:",
+            (CGRect){{16, top}, {104, 32}});
+    SetRect(gManagementResetButton, "setFrame:",
+            (CGRect){{132, top}, {160, 32}});
+    SetRect(gManagementScroll, "setFrame:",
+            (CGRect){{0, top + 40},
+                     {bounds.size.width, bounds.size.height - top - 44}});
+}
+
+static void CloseSignalManagement(id self, SEL command, id sender) {
+    (void)self; (void)command; (void)sender;
+    if (!gManagementView) return;
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(
+        gManagementView, S("endEditing:"), YES);
+    MsgVoid(gManagementView, "removeFromSuperview");
+    MsgVoid(gManagementView, "release");
+    gManagementView = gManagementScroll = (id)0;
+    gManagementNameField = gManagementRoadField = (id)0;
+    gManagementMessageLabel = (id)0;
+    gManagementCloseButton = gManagementResetButton = (id)0;
+    free(gManagementEntries);
+    gManagementEntries = NULL;
+    gManagementEntryCount = 0;
+    gManagementTargetValid = NO;
+    gManagementRouteEpoch = 0;
+    gManagementLayoutWidth = 0;
+    UpdateOverlay();
+}
+
+static void ReconfirmSignalDirection(id self, SEL command, id sender) {
+    ResetSignalRouteContext();
+    CloseSignalManagement(self, command, sender);
+}
+
+static BOOL SignalManagementRouteIsCurrent(void) {
+    RefreshUpcomingRoute();
+    if (gManagementRouteEpoch == gAppliedRouteContextEpoch &&
+        gManagementRouteEpoch == atomic_load_explicit(
+            &gRouteContextEpoch, memory_order_acquire) &&
+        gAppliedNativeNavigationEpoch == atomic_load_explicit(
+            &gNativeNavigationEpoch, memory_order_acquire)) return YES;
+    SignalManagementMessage("路线已变化，请返回重新选择路口。");
+    return NO;
+}
+
+static void HandleSignalSwipe(id self, SEL command, id gesture) {
+    (void)self; (void)command;
+    if (!gExpanded || gManagementView || !gSignalRoute || !gesture) return;
+    NSUInteger direction = ((NSUInteger (*)(id, SEL))objc_msgSend)(
+        gesture, S("direction"));
+    if (SRMove(gSignalRoute, direction == 4 ? 1 : -1)) UpdateOverlay();
+}
+
+static void BuildSignalManagementContent(id window,
+                                         const SRDisplay *current) {
+    if (!window || !gManagementView) return;
+    CGFloat width = MsgRect(window, "bounds").size.width;
+    gManagementLayoutWidth = width;
+    if (gManagementScroll) MsgVoid(gManagementScroll, "removeFromSuperview");
+    gManagementScroll = CreateSignalView("UIScrollView", (CGRect){{0, 0}, {1, 1}});
+    if (!gManagementScroll) return;
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(
+        gManagementScroll, S("setAlwaysBounceVertical:"), YES);
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(
+        gManagementScroll, S("setKeyboardDismissMode:"), 1);
+    AddOwnedSignalSubview(gManagementView, gManagementScroll);
+    CGFloat fieldWidth = width - 32;
+    char targetText[384];
+    if (gManagementTargetValid)
+        snprintf(targetText, sizeof(targetText),
+                 "当前路口 ID %llu\n按进入道路分别记录、预测和拉黑",
+                 (unsigned long long)gManagementSignalId);
+    else
+        snprintf(targetText, sizeof(targetText),
+                 "当前没有可绑定的前方路口\n仍可管理已保存的方向黑名单");
+    id targetLabel = CreateLabel((CGRect){{16, 4}, {fieldWidth, 48}}, 15, 2);
+    MsgVoidObj(targetLabel, "setTextColor:", RGBA(1, 1, 1, 1));
+    MsgVoidObj(targetLabel, "setText:", NSStr(targetText));
+    AddOwnedSignalSubview(gManagementScroll, targetLabel);
+    gManagementNameField = CreateSignalTextField(
+        (CGRect){{16, 60}, {fieldWidth, 42}}, "路口名称（可选）",
+        current ? current->name : "");
+    gManagementRoadField = CreateSignalTextField(
+        (CGRect){{16, 110}, {fieldWidth, 42}}, "进入道路（必填，例如中山路北段）",
+        current && current->bound ? current->approachName : "");
+    AddOwnedSignalSubview(gManagementScroll, gManagementNameField);
+    AddOwnedSignalSubview(gManagementScroll, gManagementRoadField);
+    id saveButton = CreateSignalButton(
+        (CGRect){{16, 162}, {fieldWidth, 42}}, "保存并绑定当前来向",
+        "dsh_save_signal_direction:", 0);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(
+        saveButton, S("setEnabled:"), gManagementTargetValid);
+    AddOwnedSignalSubview(gManagementScroll, saveButton);
+    gManagementMessageLabel = CreateLabel(
+        (CGRect){{16, 210}, {fieldWidth, 60}}, 13, 3);
+    MsgVoidObj(gManagementMessageLabel, "setTextColor:", RGBA(0.8, 0.84, 0.9, 1));
+    AddOwnedSignalSubview(gManagementScroll, gManagementMessageLabel);
+    SignalManagementMessage("新导航或重算路线后，请重新确认进入道路。\n历史方向需手动选择；拉黑只影响此来向。");
+    free(gManagementEntries);
+    gManagementEntries = NULL;
+    gManagementEntryCount = 0;
+    size_t total = gSignalHistory ? SHList(gSignalHistory, NULL, 0) : 0;
+    if (total && total <= SIZE_MAX / sizeof(SHEntry)) {
+        gManagementEntries = calloc(total, sizeof(SHEntry));
+        if (gManagementEntries) {
+            size_t available = SHList(gSignalHistory, gManagementEntries, total);
+            gManagementEntryCount = available < total ? available : total;
+        }
+    }
+    CGFloat y = 282;
+    if (!gManagementEntryCount) {
+        id emptyLabel = CreateLabel((CGRect){{16, y}, {fieldWidth, 52}}, 15, 2);
+        MsgVoidObj(emptyLabel, "setTextColor:", RGBA(1, 1, 1, 1));
+        MsgVoidObj(emptyLabel, "setText:", NSStr("尚无历史方向\n填写进入道路后开始记录"));
+        AddOwnedSignalSubview(gManagementScroll, emptyLabel);
+        y += 60;
+    }
+    for (size_t index = 0; index < gManagementEntryCount; ++index) {
+        const SHEntry *entry = &gManagementEntries[index];
+        char description[1024];
+        char timing[192];
+        if (entry->hasPrediction)
+            snprintf(timing, sizeof(timing),
+                     "红 %.0f秒 · 黄 %.0f秒 · 绿 %.0f秒（历史周期）",
+                     entry->redSeconds, entry->yellowSeconds, entry->greenSeconds);
+        else
+            snprintf(timing, sizeof(timing), "完整周期学习中");
+        snprintf(description, sizeof(description), "%s\n进入：%s · ID %llu\n%s",
+                 entry->name[0] ? entry->name : "未命名路口",
+                 entry->approachName[0] ? entry->approachName : entry->approachKey,
+                 (unsigned long long)entry->signalId, timing);
+        id label = CreateLabel((CGRect){{16, y}, {fieldWidth, 72}}, 13, 3);
+        MsgVoidObj(label, "setBackgroundColor:", RGBA(0.12, 0.15, 0.19, 1));
+        MsgVoidObj(label, "setTextColor:", RGBA(1, 1, 1, 1));
+        MsgVoidObj(label, "setText:", NSStr(description));
+        AddOwnedSignalSubview(gManagementScroll, label);
+        BOOL canChoose = gManagementTargetValid &&
+                         entry->signalId == gManagementSignalId;
+        CGFloat buttonWidth = canChoose ? (fieldWidth - 8) / 2.0 : fieldWidth;
+        id blacklistButton = CreateSignalButton(
+            (CGRect){{16, y + 78}, {buttonWidth, 38}},
+            entry->blacklisted ? "恢复该来向显示" : "拉黑该来向",
+            "dsh_toggle_signal_blacklist:", (NSInteger)index);
+        if (entry->blacklisted)
+            MsgVoidObj(blacklistButton, "setBackgroundColor:", RGBA(0.35, 0.15, 0.15, 1));
+        AddOwnedSignalSubview(gManagementScroll, blacklistButton);
+        if (canChoose) {
+            id chooseButton = CreateSignalButton(
+                (CGRect){{24 + buttonWidth, y + 78}, {buttonWidth, 38}},
+                "选择此进入道路", "dsh_choose_signal_direction:", (NSInteger)index);
+            AddOwnedSignalSubview(gManagementScroll, chooseButton);
+        }
+        y += 130;
+    }
+    ((void (*)(id, SEL, CGSize))objc_msgSend)(
+        gManagementScroll, S("setContentSize:"), (CGSize){width, y + 30});
+    LayoutSignalManagement(window);
+}
+
+static void OpenSignalManagement(id self, SEL command, id sender) {
+    (void)self; (void)command; (void)sender;
+    if (gManagementView) return;
+    id window = KeyWindow();
+    if (!window) return;
+    RefreshUpcomingRoute();
+    SRDisplay current = {0};
+    BOOL hasCurrent = gSignalRoute &&
+        SRGetVisible(gSignalRoute, 0, WallSeconds(), &current);
+    gManagementTargetValid = hasCurrent && current.id && !current.ambiguous;
+    gManagementSignalId = hasCurrent ? current.id : 0;
+    gManagementTargetOffset = hasCurrent ? current.targetOffset : -1;
+    gManagementRouteEpoch = gAppliedRouteContextEpoch;
+    gManagementView = CreateSignalView("UIView", MsgRect(window, "bounds"));
+    if (!gManagementView) return;
+    MsgVoidObj(gManagementView, "setBackgroundColor:", RGBA(0.035, 0.045, 0.06, 1));
+    MsgVoidObj(window, "addSubview:", gManagementView);
+    CGFloat top = MsgRect(window, "bounds").size.height > 600.0 ? 46.0 : 8.0;
+    gManagementCloseButton = CreateSignalButton(
+        (CGRect){{16, top}, {104, 32}}, "返回倒计时",
+        "dsh_close_signal_management:", 0);
+    AddOwnedSignalSubview(gManagementView, gManagementCloseButton);
+    gManagementResetButton = CreateSignalButton(
+        (CGRect){{132, top}, {160, 32}}, "重新确认来向",
+        "dsh_reconfirm_signal_direction:", 0);
+    AddOwnedSignalSubview(gManagementView, gManagementResetButton);
+    BuildSignalManagementContent(window, hasCurrent ? &current : NULL);
+    MsgVoidObj(window, "bringSubviewToFront:", gManagementView);
+}
+
+static const char *SignalFieldText(id field) {
+    id value = MsgId(field, "text");
+    Class characterSetClass = C("NSCharacterSet");
+    id whitespace = characterSetClass
+        ? MsgId((id)characterSetClass, "whitespaceAndNewlineCharacterSet") : (id)0;
+    if (value && whitespace)
+        value = ((id (*)(id, SEL, id))objc_msgSend)(
+            value, S("stringByTrimmingCharactersInSet:"), whitespace);
+    if (value && Responds(value, "precomposedStringWithCanonicalMapping"))
+        value = MsgId(value, "precomposedStringWithCanonicalMapping");
+    return value ? (const char *)MsgId(value, "UTF8String") : "";
+}
+
+static void SaveSignalDirection(id self, SEL command, id sender) {
+    (void)self; (void)command; (void)sender;
+    if (!gManagementView || !gManagementTargetValid || !gSignalRoute) return;
+    if (!SignalManagementRouteIsCurrent()) return;
+    if (!gSignalHistory) {
+        SignalManagementMessage("本地数据库暂不可用，当前无法保存来向。");
+        return;
+    }
+    const char *roadText = SignalFieldText(gManagementRoadField);
+    const char *nameText = SignalFieldText(gManagementNameField);
+    char road[SR_APPROACH_CAPACITY];
+    if (!roadText) roadText = "";
+    while (*roadText == ' ' || *roadText == '\t' || *roadText == '\n') ++roadText;
+    size_t length = strlen(roadText);
+    while (length && (roadText[length - 1] == ' ' ||
+                     roadText[length - 1] == '\t' || roadText[length - 1] == '\n')) --length;
+    if (!length || length + sizeof("manual:") > sizeof(road)) {
+        SignalManagementMessage(!length ? "请填写进入道路。" : "进入道路名称过长，请缩短后保存。");
+        return;
+    }
+    memcpy(road, roadText, length);
+    road[length] = '\0';
+    char key[SR_APPROACH_CAPACITY];
+    memcpy(key, "manual:", 7);
+    memcpy(key + 7, road, length + 1);
+    if (nameText && strlen(nameText) >= SR_NAME_CAPACITY) {
+        SignalManagementMessage("路口名称过长，请缩短后保存。");
+        return;
+    }
+    if (!SRBind(gSignalRoute, gManagementSignalId, gManagementTargetOffset,
+                key, road, nameText ? nameText : "", WallSeconds())) {
+        SignalManagementMessage("保存失败：目标路口可能已通过、路线已变化或数据库暂不可用。");
+        return;
+    }
+    CloseSignalManagement(self, command, sender);
+}
+
+static void ChooseSignalDirection(id self, SEL command, id sender) {
+    (void)self; (void)command;
+    NSInteger tag = ((NSInteger (*)(id, SEL))objc_msgSend)(sender, S("tag"));
+    if (tag < 0 || (size_t)tag >= gManagementEntryCount || !gManagementTargetValid) return;
+    if (!SignalManagementRouteIsCurrent()) return;
+    const SHEntry *entry = &gManagementEntries[tag];
+    if (entry->signalId != gManagementSignalId) return;
+    if (!SRBind(gSignalRoute, gManagementSignalId, gManagementTargetOffset,
+                entry->approachKey, entry->approachName, entry->name, WallSeconds())) {
+        SignalManagementMessage("绑定失败：目标路口可能已通过、路线已变化或数据库暂不可用。");
+        return;
+    }
+    CloseSignalManagement(self, command, sender);
+}
+
+static void ToggleSignalBlacklist(id self, SEL command, id sender) {
+    (void)self; (void)command;
+    NSInteger tag = ((NSInteger (*)(id, SEL))objc_msgSend)(sender, S("tag"));
+    if (tag < 0 || (size_t)tag >= gManagementEntryCount || !gSignalHistory) return;
+    SHEntry *entry = &gManagementEntries[tag];
+    BOOL next = entry->blacklisted ? NO : YES;
+    if (!SHSetBlacklisted(gSignalHistory, entry->signalId, entry->approachKey, next)) {
+        SignalManagementMessage("黑名单保存失败，请稍后重试。");
+        return;
+    }
+    entry->blacklisted = next;
+    ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(
+        sender, S("setTitle:forState:"), NSStr(next ? "恢复该来向显示" : "拉黑该来向"), 0);
+    MsgVoidObj(sender, "setBackgroundColor:", next
+               ? RGBA(0.35, 0.15, 0.15, 1) : RGBA(0.18, 0.24, 0.31, 1));
+    if (gSignalRoute) SRRefresh(gSignalRoute, WallSeconds());
+    SignalManagementMessage(next ? "已拉黑此进入方向，仍继续采集数据。" : "已恢复此进入方向的显示。");
+    UpdateOverlay();
+}
+
+static void RegisterSignalUIMethods(Class controllerClass) {
+    if (!controllerClass) return;
+    class_addMethod(controllerClass, S("dsh_swipe_signal:"),
+                    (IMP)HandleSignalSwipe, "v@:@");
+    class_addMethod(controllerClass, S("dsh_open_signal_management:"),
+                    (IMP)OpenSignalManagement, "v@:@");
+    class_addMethod(controllerClass, S("dsh_close_signal_management:"),
+                    (IMP)CloseSignalManagement, "v@:@");
+    class_addMethod(controllerClass, S("dsh_save_signal_direction:"),
+                    (IMP)SaveSignalDirection, "v@:@");
+    class_addMethod(controllerClass, S("dsh_choose_signal_direction:"),
+                    (IMP)ChooseSignalDirection, "v@:@");
+    class_addMethod(controllerClass, S("dsh_toggle_signal_blacklist:"),
+                    (IMP)ToggleSignalBlacklist, "v@:@");
+    class_addMethod(controllerClass, S("dsh_reconfirm_signal_direction:"),
+                    (IMP)ReconfirmSignalDirection, "v@:@");
+}
+
 static void ApplyOverlayLayout(id window) {
     if (!window || !gBall) return;
     CGRect bounds = MsgRect(window, "bounds");
@@ -2059,46 +2713,71 @@ static void ApplyOverlayLayout(id window) {
     if (width < 88 || height < 120) return;
 
     if (gFullView) SetRect(gFullView, "setFrame:", bounds);
-    BOOL portraitLayout = height > 600.0;
-    BOOL compactLayout = height < 352.0;
-    CGFloat lampTop = portraitLayout ? 92.0 : (compactLayout ? 8.0 : 24.0);
-    CGFloat lampHeight = portraitLayout ? 56.0 : (compactLayout ? 32.0 : 38.0);
-    CGFloat numberTop = lampTop + lampHeight + (portraitLayout ? 14.0 : 4.0);
-    CGFloat disclaimerHeight = compactLayout ? 24.0 : 30.0;
-    CGFloat bottomMargin = compactLayout ? 8.0 : 42.0;
-    CGFloat disclaimerTop = height - bottomMargin - disclaimerHeight;
-    CGFloat actionHeight = portraitLayout ? 40.0 : 32.0;
-    CGFloat detailHeight = portraitLayout ? 44.0 : 30.0;
-    CGFloat detailTop = compactLayout
-        ? disclaimerTop
-        : disclaimerTop - 4.0 - detailHeight;
-    CGFloat actionTop = (compactLayout ? disclaimerTop : detailTop) -
-                        4.0 - actionHeight;
-    CGFloat speedHeight = portraitLayout ? 34.0 : 28.0;
-    CGFloat speedTop = actionTop - 4.0 - speedHeight;
-    CGFloat unitHeight = compactLayout ? 28.0 : 42.0;
-    CGFloat unitTop = speedTop - 4.0 - unitHeight;
-    CGFloat numberHeight = unitTop - numberTop;
-    if (numberHeight < 40.0) numberHeight = 40.0;
-
+    CGFloat mainHeight = height * (2.0 / 3.0);
+    BOOL compactLayout = mainHeight < 360.0;
+    CGFloat insetTop = height > 600.0 ? 46.0 : 8.0;
+    SetRect(gManagementButton, "setFrame:",
+            (CGRect){{width - 136.0, insetTop}, {120.0, 30.0}});
+    SetRect(gFullIdentityLabel, "setFrame:",
+            (CGRect){{16, insetTop + 34}, {width - 32, 28}});
+    SetRect(gFullSourceLabel, "setFrame:",
+            (CGRect){{16, insetTop + 63}, {width - 32, 20}});
+    CGFloat lampTop = insetTop + 85.0;
+    CGFloat lampHeight = compactLayout ? 26.0 : 34.0;
+    CGFloat numberTop = lampTop + lampHeight + 2.0;
+    CGFloat numberHeight = mainHeight - numberTop -
+                           (compactLayout ? 50.0 : 144.0);
+    if (numberHeight < 20.0) numberHeight = 20.0;
+    CGFloat unitTop = numberTop + numberHeight;
     SetRect(gFullLampLabel, "setFrame:",
-            (CGRect){{24, lampTop}, {width - 48, lampHeight}});
+            (CGRect){{20, lampTop}, {width - 40, lampHeight}});
     SetRect(gFullSecondsLabel, "setFrame:",
             (CGRect){{20, numberTop}, {width - 40, numberHeight}});
     FitFullscreenNumberFont(width - 40, numberHeight);
     SetRect(gFullUnitLabel, "setFrame:",
-            (CGRect){{20, unitTop}, {width - 40, unitHeight}});
+            (CGRect){{16, unitTop}, {width - 32, 24}});
     SetRect(gFullSpeedLabel, "setFrame:",
-            (CGRect){{20, speedTop}, {width - 40, speedHeight}});
+            (CGRect){{16, unitTop + 25}, {width - 32, 24}});
     SetRect(gFullAdviceActionLabel, "setFrame:",
-            (CGRect){{20, actionTop}, {width - 40, actionHeight}});
+            (CGRect){{16, unitTop + 51}, {width - 32, 28}});
     SetRect(gFullAdviceDetailLabel, "setFrame:",
-            (CGRect){{20, detailTop}, {width - 40, detailHeight}});
+            (CGRect){{16, unitTop + 81}, {width - 32, 36}});
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(
+        gFullSpeedLabel, S("setHidden:"), compactLayout);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(
+        gFullAdviceActionLabel, S("setHidden:"), compactLayout);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(
         gFullAdviceDetailLabel, S("setHidden:"), compactLayout);
     SetRect(gFullDisclaimerLabel, "setFrame:",
-            (CGRect){{20, disclaimerTop},
-                     {width - 40, disclaimerHeight}});
+            (CGRect){{12, mainHeight - 23}, {width - 24, 20}});
+    for (unsigned index = 0; index < 2; ++index) {
+        CGFloat panelWidth = width / 2.0;
+        CGFloat panelHeight = height - mainHeight;
+        BOOL compactPanel = panelHeight < 180.0;
+        SetRect(gPreviewView[index], "setFrame:",
+                (CGRect){{index * panelWidth, mainHeight},
+                         {panelWidth, panelHeight}});
+        SetRect(gPreviewIdentityLabel[index], "setFrame:",
+                (CGRect){{8, 8}, {panelWidth - 16, compactPanel ? 22 : 36}});
+        SetRect(gPreviewSourceLabel[index], "setFrame:",
+                (CGRect){{8, compactPanel ? 31 : 46},
+                         {panelWidth - 16, compactPanel ? 22 : 32}});
+        SetRect(gPreviewLampLabel[index], "setFrame:",
+                (CGRect){{8, compactPanel ? 55 : 80}, {panelWidth - 16, 22}});
+        CGFloat previewNumberTop = compactPanel ? 78 : 106;
+        CGFloat numberHeightSmall = panelHeight - previewNumberTop - 12;
+        if (numberHeightSmall < 18.0) numberHeightSmall = 18.0;
+        SetRect(gPreviewSecondsLabel[index], "setFrame:",
+                (CGRect){{8, previewNumberTop}, {panelWidth - 16, numberHeightSmall}});
+        Class fontClass = C("UIFont");
+        if (fontClass) {
+            CGFloat fontSize = fmin(92.0, numberHeightSmall * 0.8);
+            id font = ((id (*)(id, SEL, CGFloat))objc_msgSend)(
+                (id)fontClass, S("boldSystemFontOfSize:"), fontSize);
+            MsgVoidObj(gPreviewSecondsLabel[index], "setFont:", font);
+        }
+    }
+    if (gManagementView) LayoutSignalManagement(window);
 
     CGPoint center = ((CGPoint (*)(id, SEL))objc_msgSend)(gBall, S("center"));
     if (!gBallPositioned) {
@@ -2251,6 +2930,16 @@ static void EnsureOverlay(id window) {
             gFullAdviceActionLabel = CreateLabel(fullFrame, 28.0, 1);
             gFullAdviceDetailLabel = CreateLabel(fullFrame, 15.0, 2);
             gFullDisclaimerLabel = CreateLabel(fullFrame, 15.0, 1);
+            gFullIdentityLabel = CreateLabel(fullFrame, 19.0, 1);
+            gFullSourceLabel = CreateLabel(fullFrame, 14.0, 1);
+            gManagementButton = CreateSignalButton(
+                fullFrame, "路口管理", "dsh_open_signal_management:", 0);
+            if (gFullIdentityLabel)
+                MsgVoidObj(gFullView, "addSubview:", gFullIdentityLabel);
+            if (gFullSourceLabel)
+                MsgVoidObj(gFullView, "addSubview:", gFullSourceLabel);
+            if (gManagementButton)
+                MsgVoidObj(gFullView, "addSubview:", gManagementButton);
             if (gFullLampLabel)
                 MsgVoidObj(gFullView, "addSubview:", gFullLampLabel);
             if (gFullSecondsLabel)
@@ -2277,6 +2966,34 @@ static void EnsureOverlay(id window) {
                        NSStr("仅供参考，以现场信号灯为准"));
             ((void (*)(id, SEL, BOOL))objc_msgSend)(
                 gFullView, S("setHidden:"), YES);
+            for (unsigned index = 0; index < 2; ++index) {
+                gPreviewView[index] = CreateSignalView("UIView", fullFrame);
+                if (!gPreviewView[index]) continue;
+                gPreviewIdentityLabel[index] = CreateLabel(fullFrame, 16, 2);
+                gPreviewSourceLabel[index] = CreateLabel(fullFrame, 12, 2);
+                gPreviewLampLabel[index] = CreateLabel(fullFrame, 18, 1);
+                gPreviewSecondsLabel[index] = CreateLabel(fullFrame, 80, 1);
+                MsgVoidObj(gPreviewView[index], "addSubview:", gPreviewIdentityLabel[index]);
+                MsgVoidObj(gPreviewView[index], "addSubview:", gPreviewSourceLabel[index]);
+                MsgVoidObj(gPreviewView[index], "addSubview:", gPreviewLampLabel[index]);
+                MsgVoidObj(gPreviewView[index], "addSubview:", gPreviewSecondsLabel[index]);
+                MsgVoidObj(gFullView, "addSubview:", gPreviewView[index]);
+            }
+            Class swipeClass = C("UISwipeGestureRecognizer");
+            if (swipeClass && gController) {
+                for (unsigned index = 0; index < 2; ++index) {
+                    id allocated = ((id (*)(id, SEL))objc_msgSend)(
+                        (id)swipeClass, S("alloc"));
+                    id swipe = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
+                        allocated, S("initWithTarget:action:"),
+                        gController, S("dsh_swipe_signal:"));
+                    if (swipe) {
+                        ((void (*)(id, SEL, NSUInteger))objc_msgSend)(
+                            swipe, S("setDirection:"), index ? 8 : 4);
+                        MsgVoidObj(gFullView, "addGestureRecognizer:", swipe);
+                    }
+                }
+            }
 
             if (tapClass && gController) {
                 id allocated = ((id (*)(id, SEL))objc_msgSend)(
@@ -2305,6 +3022,11 @@ static void EnsureOverlay(id window) {
     if (Responds(window, "bringSubviewToFront:"))
         MsgVoidObj(window, "bringSubviewToFront:",
                    gExpanded ? gFullView : gBall);
+    if (gManagementView) {
+        if (MsgId(gManagementView, "window") != window)
+            MsgVoidObj(window, "addSubview:", gManagementView);
+        MsgVoidObj(window, "bringSubviewToFront:", gManagementView);
+    }
 }
 
 typedef struct {
@@ -2425,6 +3147,42 @@ static int DisplaySpeedKmh(BOOL *usesAverage) {
     return -1;
 }
 
+static void FormatSignalIdentity(const SRDisplay *display, char *name,
+                                  size_t nameCapacity, char *source,
+                                  size_t sourceCapacity) {
+    if (!display) return;
+    if (display->name[0]) snprintf(name, nameCapacity, "%s", display->name);
+    else snprintf(name, nameCapacity, "路口 %llu", (unsigned long long)display->id);
+    const char *sourceName = display->seconds < 0 ? "等待数据"
+        : (display->predicted ? "预测" : "原生");
+    const char *road = display->bound && display->approachName[0]
+        ? display->approachName : "未选来向";
+    snprintf(source, sourceCapacity, "%s · %s%s", sourceName, road,
+             display->ambiguous ? " · 来向待确认" : "");
+}
+
+static void UpdateSignalPreview(unsigned index, const SRDisplay *display) {
+    if (index >= 2 || !gPreviewView[index]) return;
+    LampState state = display ? (LampState)display->color : LampUnknown;
+    id textColor = LampTextColor(state);
+    MsgVoidObj(gPreviewView[index], "setBackgroundColor:", LampBackground(state, YES));
+    MsgVoidObj(gPreviewLampLabel[index], "setTextColor:", textColor);
+    MsgVoidObj(gPreviewSecondsLabel[index], "setTextColor:", textColor);
+    MsgVoidObj(gPreviewIdentityLabel[index], "setTextColor:", textColor);
+    MsgVoidObj(gPreviewSourceLabel[index], "setTextColor:", textColor);
+    char name[256] = "暂无后续路口";
+    char source[512] = "";
+    char seconds[32] = "--";
+    if (display) {
+        FormatSignalIdentity(display, name, sizeof(name), source, sizeof(source));
+        if (display->seconds >= 0) snprintf(seconds, sizeof(seconds), "%d秒", display->seconds);
+    }
+    MsgVoidObj(gPreviewIdentityLabel[index], "setText:", NSStr(name));
+    MsgVoidObj(gPreviewSourceLabel[index], "setText:", NSStr(source));
+    MsgVoidObj(gPreviewLampLabel[index], "setText:", NSStr(display ? LampName(state) : ""));
+    MsgVoidObj(gPreviewSecondsLabel[index], "setText:", NSStr(seconds));
+}
+
 static void UpdateOverlay(void) {
     if (!gBall) return;
     double now = MonotonicSeconds();
@@ -2448,7 +3206,7 @@ static void UpdateOverlay(void) {
     else if (state == LampUnknown) hiddenReason = "unknown-lamp";
     else seconds = remaining > 0 ? (int)ceil(remaining) : 0;
     if (seconds < 0) {
-        if (gCurrentSeconds >= 0) {
+        if (gCurrentSeconds >= 0 && !gRouteSnapshotAvailable) {
             double carCapturedAt = atomic_load_explicit(
                 &gCarTableCapturedAt, memory_order_relaxed);
             double carCaptureAt = atomic_load_explicit(
@@ -2465,6 +3223,21 @@ static void UpdateOverlay(void) {
                         &gCarCaptureSignalId, memory_order_relaxed),
                     gCarSerializedRejectReason, gRawCarRejectReason);
         }
+        state = LampUnknown;
+        countdownSource = CountdownSourceUnknown;
+    }
+    SRDisplay selected = {0};
+    BOOL hasRouteDisplay = gSignalRoute &&
+        SRGetVisible(gSignalRoute, 0, WallSeconds(), &selected);
+    if (hasRouteDisplay) {
+        seconds = selected.seconds;
+        state = (LampState)selected.color;
+        countdownSource = selected.source >= CountdownSourceCar &&
+                          selected.source <= CountdownSourceCarInput
+            ? (CountdownSource)selected.source : CountdownSourceUnknown;
+    } else if (gRouteSnapshotAvailable) {
+        /* A valid empty/filtered route must never resurrect a blocked lamp. */
+        seconds = -1;
         state = LampUnknown;
         countdownSource = CountdownSourceUnknown;
     }
@@ -2485,6 +3258,10 @@ static void UpdateOverlay(void) {
         active.signalId == 0 || distance < 0 || distance > 2000 ||
         distanceAge < 0 || distanceAge > 2.5)
         distance = -1;
+    if (hasRouteDisplay)
+        distance = isfinite(selected.distanceMeters) &&
+                   selected.distanceMeters >= 0 && selected.distanceMeters <= 9999
+            ? (int)ceil(selected.distanceMeters) : -1;
 
     BOOL speedUsesAverage = NO;
     int displaySpeedKmh = DisplaySpeedKmh(&speedUsesAverage);
@@ -2494,9 +3271,9 @@ static void UpdateOverlay(void) {
     char speedText[64];
     snprintf(secondsText, sizeof(secondsText), seconds >= 0 ? "%d" : "--",
              seconds);
-    if (countdownSource == CountdownSourceCarInput) {
+    if (!hasRouteDisplay && countdownSource == CountdownSourceCarInput) {
         snprintf(distanceText, sizeof(distanceText), "原始取数");
-    } else if (IsCarCountdownSource(countdownSource)) {
+    } else if (!hasRouteDisplay && IsCarCountdownSource(countdownSource)) {
         snprintf(distanceText, sizeof(distanceText), "汽车参考");
     } else if (distance < 0) {
         snprintf(distanceText, sizeof(distanceText), "--米");
@@ -2506,13 +3283,13 @@ static void UpdateOverlay(void) {
         snprintf(distanceText, sizeof(distanceText), "%.1f公里",
                  (double)distance / 1000.0);
     }
-    if (countdownSource == CountdownSourceCarInput)
+    if (!hasRouteDisplay && countdownSource == CountdownSourceCarInput)
         snprintf(unitText, sizeof(unitText), "秒 · 原始汽车信号参考");
-    else if (IsCarCountdownSource(countdownSource))
+    else if (!hasRouteDisplay && IsCarCountdownSource(countdownSource))
         snprintf(unitText, sizeof(unitText), "秒 · 汽车信号参考");
     else
         snprintf(unitText, sizeof(unitText), "秒 · 距路口 %s", distanceText);
-    if (countdownSource == CountdownSourceCarInput) {
+    if (!hasRouteDisplay && countdownSource == CountdownSourceCarInput) {
         snprintf(speedText, sizeof(speedText), "取数模式 · 速度与距离暂不显示");
     } else if (displaySpeedKmh < 0) {
         snprintf(speedText, sizeof(speedText), "当前速度 -- km/h");
@@ -2526,12 +3303,22 @@ static void UpdateOverlay(void) {
 
     LiveAdviceSnapshot advice = {0};
     advice.result.action = AdviceUnavailable;
-    if (seconds >= 0 && distance >= 0)
+    BOOL adviceAllowed = hasRouteDisplay
+        ? (!selected.predicted && !selected.ambiguous &&
+         selected.isNearest && activeReady && active.signalId == selected.id &&
+         active.targetOffset == selected.targetOffset &&
+         countdownSource == CountdownSourceTravel &&
+         active.candidateCount == 1 && distanceAge >= 0 && distanceAge <= 2.5)
+        : !gRouteSnapshotAvailable;
+    if (seconds >= 0 && distance >= 0 && adviceAllowed)
         advice = ComputeLiveAdvice(state, &active);
-    advice.result = AdviceStabilize(
-        &gAdviceStabilizer, advice.result,
-        distance >= 0 ? active.signalId : 0, WallSeconds(),
-        advice.strategySpeedKmh / 3.6, 2.0, 0.15);
+    if (adviceAllowed)
+        advice.result = AdviceStabilize(
+            &gAdviceStabilizer, advice.result,
+            distance >= 0 ? active.signalId : 0, WallSeconds(),
+            advice.strategySpeedKmh / 3.6, 2.0, 0.15);
+    else
+        memset(&gAdviceStabilizer, 0, sizeof(gAdviceStabilizer));
     char adviceActionText[96];
     char adviceDetailText[128];
     AdviceResult decision = advice.result;
@@ -2577,6 +3364,14 @@ static void UpdateOverlay(void) {
             break;
         case AdviceUnavailable:
         default: {
+            if (!adviceAllowed) {
+                snprintf(adviceActionText, sizeof(adviceActionText), "%s",
+                         hasRouteDisplay && selected.predicted
+                             ? "历史周期预测" : "前方路口预览");
+                snprintf(adviceDetailText, sizeof(adviceDetailText),
+                         "上滑查看后一个 · 下滑返回前一个");
+                break;
+            }
             if (countdownSource == CountdownSourceCarInput) {
                 snprintf(adviceActionText, sizeof(adviceActionText),
                          "取数优先：仅显示倒计时");
@@ -2619,7 +3414,8 @@ static void UpdateOverlay(void) {
     MsgVoidObj(gBallDistanceLabel, "setTextColor:", textColor);
     MsgVoidObj(gBallLampLabel, "setText:", NSStr(LampName(state)));
     MsgVoidObj(gBallSecondsLabel, "setText:", NSStr(secondsText));
-    MsgVoidObj(gBallDistanceLabel, "setText:", NSStr(distanceText));
+    MsgVoidObj(gBallDistanceLabel, "setText:",
+               NSStr(hasRouteDisplay && selected.predicted ? "预测" : distanceText));
 
     if (gFullView) {
         MsgVoidObj(gFullView, "setBackgroundColor:", LampBackground(state, YES));
@@ -2630,6 +3426,8 @@ static void UpdateOverlay(void) {
         MsgVoidObj(gFullAdviceActionLabel, "setTextColor:", textColor);
         MsgVoidObj(gFullAdviceDetailLabel, "setTextColor:", textColor);
         MsgVoidObj(gFullDisclaimerLabel, "setTextColor:", textColor);
+        MsgVoidObj(gFullIdentityLabel, "setTextColor:", textColor);
+        MsgVoidObj(gFullSourceLabel, "setTextColor:", textColor);
         MsgVoidObj(gFullLampLabel, "setText:", NSStr(LampName(state)));
         MsgVoidObj(gFullSecondsLabel, "setText:", NSStr(secondsText));
         MsgVoidObj(gFullUnitLabel, "setText:", NSStr(unitText));
@@ -2638,6 +3436,25 @@ static void UpdateOverlay(void) {
                    NSStr(adviceActionText));
         MsgVoidObj(gFullAdviceDetailLabel, "setText:",
                    NSStr(adviceDetailText));
+        char identity[256] = "下一个信号灯";
+        char sourceText[512] = "原生数据 · 来向待确认";
+        if (hasRouteDisplay)
+            FormatSignalIdentity(&selected, identity, sizeof(identity),
+                                 sourceText, sizeof(sourceText));
+        else if (gRouteSnapshotAvailable) {
+            snprintf(identity, sizeof(identity), "没有可显示的前方路口");
+            snprintf(sourceText, sizeof(sourceText), "路口管理中可恢复已拉黑的方向");
+        } else if (seconds < 0) {
+            snprintf(sourceText, sizeof(sourceText), "等待原生数据");
+        }
+        MsgVoidObj(gFullIdentityLabel, "setText:", NSStr(identity));
+        MsgVoidObj(gFullSourceLabel, "setText:", NSStr(sourceText));
+        for (unsigned index = 0; index < 2; ++index) {
+            SRDisplay preview = {0};
+            BOOL ready = hasRouteDisplay &&
+                SRGetVisible(gSignalRoute, index + 1, WallSeconds(), &preview);
+            UpdateSignalPreview(index, ready ? &preview : NULL);
+        }
     }
 }
 
@@ -2772,6 +3589,7 @@ static void Tick(id self, SEL command, id timer) {
                                     displayGenerationBeforeSources))
             InvalidateUnselectedCarDisplay();
     }
+    RefreshUpcomingRoute();
     UpdateOverlay();
 }
 
@@ -2779,6 +3597,7 @@ static void EnterBackground(id self, SEL command, id notification) {
     (void)self;
     (void)command;
     (void)notification;
+    ResetSignalRouteContext();
     if (gTimer) MsgVoid(gTimer, "invalidate");
     gTimer = 0;
 }
@@ -2787,6 +3606,7 @@ static void EnterForeground(id self, SEL command, id notification) {
     (void)self;
     (void)command;
     (void)notification;
+    ResetSignalRouteContext();
     ScheduleTimer();
 }
 
@@ -2835,6 +3655,7 @@ __attribute__((constructor)) static void AMapSignalCountdownInit(void) {
                     (IMP)CloseFullscreen, "v@:@");
     class_addMethod(controllerClass, S("dsh_pan_ball:"),
                     (IMP)HandleBallPan, "v@:@");
+    RegisterSignalUIMethods(controllerClass);
     gController = MsgId((id)controllerClass, "new");
     if (gController && Responds(gController, "performSelector:withObject:afterDelay:")) {
         ((void (*)(id, SEL, SEL, id, double))objc_msgSend)(

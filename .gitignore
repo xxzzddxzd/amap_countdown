@@ -1,4 +1,5 @@
 build/
+device-smoke-reports/
 *.deb
 stage/
 toolchain-probe.m

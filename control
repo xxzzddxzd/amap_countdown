@@ -1,8 +1,8 @@
 Package: com.dsh.amapcycleassist
 Name: AMap Signal Countdown
-Version: 1.0.56
+Version: 1.1.0
 Architecture: iphoneos-arm64
-Description: Personal AMap 16.11.1 traffic-signal countdown, native route-distance, and cycling speed-advice HUD. Reads only in-process native travel state; no OCR, network interception, GPS/Core Location collection, or geospatial distance inference.
+Description: Personal AMap 16.11.1 three-signal countdown HUD with SQLite history by entering road, direction blacklists, historical cycle prediction, and cycling speed advice. Reads only in-process native travel state; no OCR, network interception, GPS/Core Location collection, or geospatial distance inference.
 Maintainer: local
 Author: local
 Section: Tweaks
